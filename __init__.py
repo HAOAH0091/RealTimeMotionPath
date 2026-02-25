@@ -663,6 +663,91 @@ class DrawCollector:
         for (radius, color), points in self.circles.items():
             draw_batched_billboard_circles(context, points, radius, color, shader)
 
+def draw_origin_indicator(context, obj, bone, styles):
+    """Draw an origin indicator for the active object/bone on top of the motion path."""
+    try:
+        if bone is not None:
+            # Pose mode: world position of the bone head via matrix_world @ bone.matrix
+            world_pos = (obj.matrix_world @ bone.matrix).translation
+        else:
+            world_pos = obj.matrix_world.translation
+
+        px = world_pos[0]
+        py = world_pos[1]
+        pz = world_pos[2]
+
+        if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
+                abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
+            return
+
+        pos = (px, py, pz)
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        style = styles.origin_indicator_style
+        outer_size = styles.origin_indicator_size
+        outer_color = tuple(styles.origin_indicator_color)
+        inner_color = tuple(styles.origin_indicator_inner_color)
+
+        gpu.state.blend_set('ALPHA')
+
+        if style == 'DOT':
+            draw_billboard_circle(context, pos, outer_size / 2, inner_color, shader)
+
+        elif style == 'RING':
+            right, up = get_billboard_basis(context)
+            if right is None or up is None:
+                return
+            scale = get_pixel_scale(context, pos, outer_size / 2)
+            if scale == 0:
+                return
+            rx, ry, rz = right[0], right[1], right[2]
+            ux, uy, uz = up[0], up[1], up[2]
+            SEGMENTS = 32
+            ring_verts = []
+            for i in range(SEGMENTS):
+                angle = 2 * math.pi * i / SEGMENTS
+                cos_a = math.cos(angle)
+                sin_a = math.sin(angle)
+                vx = px + scale * (cos_a * rx + sin_a * ux)
+                vy = py + scale * (cos_a * ry + sin_a * uy)
+                vz = pz + scale * (cos_a * rz + sin_a * uz)
+                ring_verts.append((vx, vy, vz))
+            batch = batch_for_shader(shader, 'LINE_LOOP', {"pos": ring_verts})
+            shader.bind()
+            shader.uniform_float("color", outer_color)
+            gpu.state.line_width_set(2.0)
+            batch.draw(shader)
+
+        elif style == 'RING_DOT':
+            right, up = get_billboard_basis(context)
+            if right is None or up is None:
+                return
+            scale = get_pixel_scale(context, pos, outer_size / 2)
+            if scale == 0:
+                return
+            rx, ry, rz = right[0], right[1], right[2]
+            ux, uy, uz = up[0], up[1], up[2]
+            SEGMENTS = 32
+            ring_verts = []
+            for i in range(SEGMENTS):
+                angle = 2 * math.pi * i / SEGMENTS
+                cos_a = math.cos(angle)
+                sin_a = math.sin(angle)
+                vx = px + scale * (cos_a * rx + sin_a * ux)
+                vy = py + scale * (cos_a * ry + sin_a * uy)
+                vz = pz + scale * (cos_a * rz + sin_a * uz)
+                ring_verts.append((vx, vy, vz))
+            batch = batch_for_shader(shader, 'LINE_LOOP', {"pos": ring_verts})
+            shader.bind()
+            shader.uniform_float("color", outer_color)
+            gpu.state.line_width_set(2.0)
+            batch.draw(shader)
+            # Center dot (1/3 of outer size)
+            draw_billboard_circle(context, pos, outer_size / 6, inner_color, shader)
+
+    except Exception as e:
+        print(f"Error in draw_origin_indicator: {e}")
+
+
 def draw_motion_path_overlay():
     """Drawing advanced motion path overlays"""
     # Dynamically get the context for the current draw call
@@ -753,6 +838,10 @@ def draw_motion_path_overlay():
             
         # Submit Batches
         collector.draw(context)
+
+        # Draw origin indicator on top of motion path
+        if styles.show_origin_indicator:
+            draw_origin_indicator(context, obj, target_bone, styles)
         
     except Exception as e:
         print(f"Error in motion path overlay: {e}")
@@ -2305,6 +2394,20 @@ class MotionPathStyleSettings(bpy.types.PropertyGroup):
     handle_endpoint_color: bpy.props.FloatVectorProperty(name="Handle Endpoint Color", subtype='COLOR', size=4, default=(0.953, 0.78, 0.0, 1.0), min=0.0, max=1.0)
     selected_handle_endpoint_color: bpy.props.FloatVectorProperty(name="Selected Handle Endpoint Color", subtype='COLOR', size=4, default=(1.0, 0.102, 0.0, 1.0), min=0.0, max=1.0)
 
+    # Origin Indicator
+    show_origin_indicator: bpy.props.BoolProperty(name="Show Origin Indicator", default=True)
+    origin_indicator_style: bpy.props.EnumProperty(
+        name="Origin Style",
+        items=[
+            ('RING',     "Ring",     "Hollow circle ring"),
+            ('DOT',      "Dot",      "Filled circle dot"),
+            ('RING_DOT', "Ring+Dot", "Ring with center dot (like Blender origin)"),
+        ],
+        default='RING_DOT')
+    origin_indicator_size: bpy.props.FloatProperty(name="Origin Size", default=12.0, min=4.0, max=40.0)
+    origin_indicator_color: bpy.props.FloatVectorProperty(name="Origin Color", subtype='COLOR', size=4, default=(1.0, 1.0, 1.0, 0.9), min=0.0, max=1.0)
+    origin_indicator_inner_color: bpy.props.FloatVectorProperty(name="Origin Inner Color", subtype='COLOR', size=4, default=(1.0, 0.4, 0.0, 1.0), min=0.0, max=1.0)
+
 class MOTIONPATH_PT_header_settings(bpy.types.Panel):
     bl_label = "Motion Path Settings"
     bl_idname = "MOTIONPATH_PT_header_settings"
@@ -2358,6 +2461,16 @@ class MOTIONPATH_AddonPreferences(bpy.types.AddonPreferences):
         col.prop(styles, "handle_endpoint_size")
         col.prop(styles, "handle_endpoint_color")
         col.prop(styles, "selected_handle_endpoint_color")
+
+        col.separator()
+        col.label(text=iface_("Origin Indicator"))
+        col.prop(styles, "show_origin_indicator")
+        if styles.show_origin_indicator:
+            col.prop(styles, "origin_indicator_style")
+            col.prop(styles, "origin_indicator_size")
+            col.prop(styles, "origin_indicator_color")
+            if styles.origin_indicator_style in {'RING_DOT', 'DOT'}:
+                col.prop(styles, "origin_indicator_inner_color")
 
 class MOTIONPATH_MT_context_menu(bpy.types.Menu):
     bl_label = "Motion Path Context Menu"
