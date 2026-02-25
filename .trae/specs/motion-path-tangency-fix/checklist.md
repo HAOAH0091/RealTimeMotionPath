@@ -1,0 +1,6 @@
+- [x] `build_position_cache` correctly populates `velocity_prev` and `velocity_next`
+- [x] Start Frame shows ONLY Right Handle
+- [x] End Frame shows ONLY Left Handle
+- [x] Middle Frames show BOTH Handles
+- [x] Handle directions are tangent to the path (no visual kinks)
+- [x] Interaction (hover/select) works only for visible handles
