@@ -1,5 +1,0 @@
-- [x] Handle length is determined by F-Curve data, not velocity magnitude
-- [x] Handle direction is determined by World Velocity (tangent to path)
-- [x] Handles are NOT drawn when object velocity is effectively zero (< 1e-6)
-- [x] Last frame (clamped) allows selecting/dragging the keyframe point without handle interference
-- [x] Moving handles updates the path shape correctly

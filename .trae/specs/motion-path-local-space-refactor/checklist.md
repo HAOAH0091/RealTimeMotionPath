@@ -1,9 +1,0 @@
-- [ ] `build_position_cache` correctly stores Local Space coordinates (no world velocity).
-- [ ] Path lines and points are drawn correctly in Local Space transformed by the Current Parent Matrix.
-- [ ] Handles are drawn using F-Curve data directly (not velocity derived), transformed by Current Parent Matrix.
-- [ ] When Parent Object moves/rotates, the drawn path follows rigidly (does not deform).
-- [ ] Hovering over points and handles highlights them correctly (Hit Testing works with new transforms).
-- [ ] Dragging a point (`move_selected_points`) works correctly and feels "sticky" (follows mouse exactly).
-- [ ] Dragging a handle (`move_selected_handles`) works correctly and updates the F-Curve intuitively.
-- [ ] Verify functionality in Object Mode with a Parent.
-- [ ] Verify functionality in Pose Mode (Bone) with a Parent Bone or Object Parent.
