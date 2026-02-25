@@ -1,14 +1,14 @@
 bl_info = {
-    "name" : "Motion-path pro",
-    "author" : "Hamdi Amer", 
-    "description" : "Update motion path in real time from graph editor and viewport",
+    "name" : "RealTimeMotionPath",
+    "author" : "HAOAH",
+    "description" : "Real-time motion path display and manipulation in 3D viewport, supports direct handle editing and graph editor sync",
     "blender" : (5, 0, 0),
-    "version" : (2, 1, 0),
-    "location" : "Graph Editor",
+    "version" : (1, 0, 0),
+    "location" : "3D Viewport › Header",
     "warning" : "",
-    "doc_url": "", 
-    "tracker_url": "", 
-    "category" : "Graph" 
+    "doc_url" : "",
+    "tracker_url" : "",
+    "category" : "Animation"
 }
 
 
