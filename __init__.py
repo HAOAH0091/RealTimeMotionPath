@@ -17,12 +17,18 @@ import bpy
 import bpy_extras
 import bpy_extras.view3d_utils
 import mathutils
-import re
 import math
 import gpu
 import blf
+import time
+from bpy.app.handlers import persistent
 from gpu_extras.batch import batch_for_shader
-from bpy_extras import view3d_utils  
+from bpy_extras import view3d_utils
+from bpy.app.translations import pgettext_iface
+
+def iface_(msg):
+    return pgettext_iface(msg)
+from . import translations  
 
 
 class MotionPathState:
@@ -52,6 +58,9 @@ class MotionPathState:
 
 
 _state = MotionPathState()
+
+# Global lock to prevent recursion in smart update
+_is_updating_cache = False
 
 
 HANDLE_SIZE = 10
@@ -99,7 +108,8 @@ def get_pixel_scale(context, pos, pixel_size):
         return 0.0
         
     right = rv3d.view_rotation @ mathutils.Vector((1, 0, 0))
-    offset_pos = pos + right * 0.001
+    # Ensure pos is a Vector for math operations (it might be a tuple from safe drawing code)
+    offset_pos = mathutils.Vector(pos) + right * 0.001
     co2d_offset = view3d_utils.location_3d_to_region_2d(region, rv3d, offset_pos)
     
     if co2d_offset is None:
@@ -243,20 +253,24 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
         angle = 2 * math.pi * i / segments
         unit_verts.append((math.cos(angle), math.sin(angle)))
     
-    # Batch processing - Increase batch size to reduce draw calls
-    # 4000 points * 9 vertices = 36,000 vertices (Safe for 16-bit indices limit of 65535)
-    BATCH_SIZE = 4000
+    # Batch processing - Reduced batch size to prevent driver crashes
+    BATCH_SIZE = 500
     total_points = len(points)
     
     # Convert color to tuple if it's a Vector, for safety with GPU shader
-    if hasattr(color, 'to_tuple'):
-        safe_color = color.to_tuple()
-    else:
-        safe_color = tuple(color)
-        
-    # Ensure color is RGBA
-    if len(safe_color) == 3:
-        safe_color = (safe_color[0], safe_color[1], safe_color[2], 1.0)
+    try:
+        if hasattr(color, 'to_tuple'):
+            safe_color = color.to_tuple()
+        else:
+            safe_color = tuple(float(c) for c in color)
+            
+        # Ensure color is RGBA
+        if len(safe_color) == 3:
+            safe_color = (safe_color[0], safe_color[1], safe_color[2], 1.0)
+        elif len(safe_color) != 4:
+            safe_color = (1.0, 1.0, 1.0, 1.0) # Fallback
+    except:
+        safe_color = (1.0, 1.0, 1.0, 1.0)
 
     for i in range(0, total_points, BATCH_SIZE):
         try:
@@ -321,6 +335,9 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
             shader.bind()
             shader.uniform_float("color", safe_color)
             batch.draw(shader)
+            
+            # Explicitly cleanup batch to prevent driver resource exhaustion
+            del batch
         except Exception as e:
             print(f"Error drawing batch: {e}")
             continue
@@ -328,8 +345,8 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
 def is_location_fcurve(fcurve, bone_name=None):
     """Check if fcurve is a location fcurve for an object or a specific bone."""
     if bone_name:
-        return f'pose.bones["{bone_name}"].location' in fcurve.data_path
-    return 'location' in fcurve.data_path
+        return fcurve.data_path == f'pose.bones["{bone_name}"].location'
+    return fcurve.data_path == 'location'
 
 def is_keyframe_at_frame(fcurves, frame_num, bone_name=None):
     """Check if there's a keyframe at the given frame for location fcurves."""
@@ -340,7 +357,7 @@ def is_keyframe_at_frame(fcurves, frame_num, bone_name=None):
                     return True
     return False
 
-def calculate_path_from_fcurves(obj, action, frames):
+def calculate_path_from_fcurves(obj, action, frames, bone_name=None):
     """
     Calculate path points directly from fcurves, bypassing scene evaluation.
     Returns: {frame: {'position': Vector((x,y,z))}}
@@ -348,7 +365,7 @@ def calculate_path_from_fcurves(obj, action, frames):
     path_data = {}
     
     # Pre-fetch fcurves for location
-    fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc)]
+    fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc, bone_name)]
     
     # Group by axis
     fcurves_by_axis = {}
@@ -357,9 +374,15 @@ def calculate_path_from_fcurves(obj, action, frames):
         
     # Get default values if fcurve missing (from current object state)
     # Note: This assumes defaults don't change over time (which is true if no fcurve)
-    # Also include Delta Location which is not in F-Curves
-    defaults = obj.location.copy()
-    delta_loc = obj.delta_location
+    if bone_name:
+        if bone_name in obj.pose.bones:
+            defaults = obj.pose.bones[bone_name].location.copy()
+        else:
+            defaults = mathutils.Vector((0, 0, 0))
+        delta_loc = mathutils.Vector((0, 0, 0)) # Bones don't have delta location usually
+    else:
+        defaults = obj.location.copy()
+        delta_loc = obj.delta_location
     
     for frame in frames:
         pos = defaults.copy()
@@ -377,180 +400,205 @@ def calculate_path_from_fcurves(obj, action, frames):
     return path_data
 
 def build_position_cache(context):
-    """Build cache of 3D positions for keyframes and path line."""
-    global _state
-    _state.position_cache = {}
-    _state.path_vertices = []
-    _state.path_batch = None
+    """
+    Build cache of 3D positions for keyframes and path line.
+
+    UNIFIED FAST PATH (all objects and all bones):
+      Always reads F-Curve values directly via fcurve.evaluate().
+      scene.frame_set() is NEVER called — the scene state is never modified.
+      This guarantees:
+        - No interaction lag (G/R/S transforms are never disrupted).
+        - Correct behaviour for rotation/scale constraints: the F-Curve-driven
+          location is unaffected by constraints that only change rotation or scale.
+          The corrected get_current_parent_matrix() ensures the displayed path is
+          drawn without constraint-rotation contamination.
+        - Bones with no location F-Curves (pure IK end-effectors, etc.) produce an
+          empty frame set and are silently skipped — correct, nothing to display.
+
+    COORDINATE SPACE CONTRACT:
+      Object mode:
+        Cached positions are in F-Curve local space:
+          - Unparented: equals world space.
+          - Parented:   equals parent-relative space (parent transform applied at draw).
+        get_current_parent_matrix() returns Identity (unparented) or
+        obj.parent.matrix_world (parented).
+
+      Pose (bone) mode:
+        Cached positions are in bone matrix_basis space (local bone offset).
+        get_current_parent_matrix() returns:
+          obj.matrix_world @ bone.parent.matrix @ bone.bone.matrix_local  (child bone)
+          obj.matrix_world @ bone.bone.matrix_local                       (root bone)
+        This converts the F-Curve offset to world space correctly without
+        incorporating the bone's own constraint effects.
+
+    NOTE on Smart Interaction:
+      on_depsgraph_update skips this function when only OBJECT (not ACTION) changes,
+      reusing the existing cache so interactive transforms (G/R/S) feel smooth.
+    """
+    global _state, _is_updating_cache
     
-    obj = context.active_object
-    if not obj or not obj.animation_data or not obj.animation_data.action:
+    # Atomic Lock: Prevent recursive updates
+    if _is_updating_cache:
         return
+        
+    _is_updating_cache = True
     
-    if hasattr(bpy.context.window_manager, 'skip_motion_path_cache'):
-        if bpy.context.window_manager.skip_motion_path_cache:
+    try:
+        _state.position_cache = {}
+        _state.path_vertices = []
+        _state.path_batch = None
+        
+        obj = context.active_object
+        
+        # Combined early exit checks
+        if (not obj or 
+            not obj.animation_data or 
+            not obj.animation_data.action or
+            (hasattr(bpy.context.window_manager, 'skip_motion_path_cache') and 
+             bpy.context.window_manager.skip_motion_path_cache)):
             return
-            
-    wm = context.window_manager
-    action = obj.animation_data.action
-    view_layer = context.view_layer
-    current_frame = context.scene.frame_current
-    frame_start = context.scene.frame_start
-    frame_end = context.scene.frame_end
-    
-    # 1. Build Keyframe Cache (Sparse) for Handles and Points
-    if obj.mode == 'POSE':
-        bones_to_cache = set(context.selected_pose_bones or [])
-        if context.active_pose_bone:
-            bones_to_cache.add(context.active_pose_bone)
-        for bone in bones_to_cache:
-            bone_name = bone.name
-            fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc, bone_name)]
-            frames = set(int(kp.co[0]) for fc in fcurves for kp in fc.keyframe_points
-                         if frame_start <= kp.co[0] <= frame_end)
-            _state.position_cache[bone_name] = {}
-            for frame in frames:
-                context.scene.frame_set(int(frame))
-                view_layer.update()
                 
-                # Store position in Local Basis Space (Translation Component)
-                # This matches the "Unified Parent Matrix" logic which expects Local Basis coordinates.
-                # bone.location drives matrix_basis translation.
-                # Use matrix_basis.translation to be safe if other factors affect it.
-                pos = bone.matrix_basis.translation.copy()
-                
-                # No velocity calculation needed
-                
-                _state.position_cache[bone_name][frame] = {
-                    'position': pos,
-                    # 'parent_matrix' not needed here, will be determined at draw time
-                    # 'velocity' not needed
-                }
-    else:
-        # Check for constraints or drivers that might affect location
-        has_constraints = bool(obj.constraints)
-        has_drivers = False
-        if obj.animation_data and obj.animation_data.drivers:
-            for d in obj.animation_data.drivers:
-                if 'location' in d.data_path:
-                    has_drivers = True
-                    break
+        wm = context.window_manager
+        action = obj.animation_data.action
+        frame_start = context.scene.frame_start
+        frame_end = context.scene.frame_end
         
-        use_fast_path = not (has_constraints or has_drivers)
-        
-        fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc)]
-        frames = sorted(list(set(int(kp.co[0]) for fc in fcurves for kp in fc.keyframe_points
-                     if frame_start <= kp.co[0] <= frame_end)))
-        
-        _state.position_cache[None] = {}
-        
-        if use_fast_path:
-            # FAST PATH: Evaluate F-Curves directly
+        # 1. Build Keyframe Cache (Sparse) for Handles and Points
+        if obj.mode == 'POSE':
+            bones_to_cache = set(context.selected_pose_bones or [])
+            if context.active_pose_bone:
+                bones_to_cache.add(context.active_pose_bone)
+
+            # FAST PATH for all bones — read F-Curves directly, no frame_set needed.
+            # Bones with constraints (IK, Damped Track, etc.) or drivers are handled
+            # the same way: only the F-Curve-driven location offset is shown.
+            # Bones with no location F-Curves (e.g. pure IK end-effectors) produce an
+            # empty 'frames' set and are skipped — correct behaviour (nothing to display).
+            for bone in bones_to_cache:
+                bone_name = bone.name
+                fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc, bone_name)]
+                frames = set(int(kp.co[0]) for fc in fcurves for kp in fc.keyframe_points
+                             if frame_start <= kp.co[0] <= frame_end)
+                if not frames:
+                    continue
+                path_data = calculate_path_from_fcurves(obj, action, frames, bone_name=bone_name)
+                _state.position_cache[bone_name] = path_data
+        else:
+            # OBJECT MODE — FAST PATH: read F-Curves directly for all objects.
+            # Constraints / drivers that affect rotation or scale do not change the
+            # F-Curve-driven location values, so this is always correct for position.
+            # The parent matrix fix in get_current_parent_matrix ensures that
+            # rotation-only constraints (Damped Track, etc.) no longer pollute the
+            # displayed path.
+            fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc)]
+            frames = sorted(set(int(kp.co[0]) for fc in fcurves for kp in fc.keyframe_points
+                         if frame_start <= kp.co[0] <= frame_end))
             path_data = calculate_path_from_fcurves(obj, action, frames)
             _state.position_cache[None] = path_data
-        else:
-            # SLOW PATH: Scene Evaluation
-            for frame in frames:
-                context.scene.frame_set(int(frame))
-                view_layer.update()
-                
-                # Store position in Local Basis Space (Parent Space)
-                # Matches Unified Parent Matrix logic
-                pos = obj.matrix_basis.translation.copy()
-                
-                _state.position_cache[None][frame] = {
-                    'position': pos,
-                }
-
-    # 2. Build Path Line Batch (Dense) - Only if custom draw is active
-    if wm.custom_path_draw_active:
-        path_points = []
-        # Determine which object/bone to trace
-        target_bone = None
-        if obj.mode == 'POSE':
-             # Use active pose bone for the path line
-             target_bone = context.active_pose_bone
-             if not target_bone and context.selected_pose_bones:
-                 target_bone = context.selected_pose_bones[0]
-        
-        if (obj.mode == 'OBJECT') or (obj.mode == 'POSE' and target_bone):
-            # Optimization: Only calculate path if there are location fcurves
-            should_calculate_path = False
+    
+        # 2. Build Path Line Batch (Dense) - Only if custom draw is active
+        if wm.custom_path_draw_active:
+            path_points = []
+            # Determine which object/bone to trace
+            target_bone = None
+            if obj.mode == 'POSE':
+                 # Use active pose bone for the path line
+                 target_bone = context.active_pose_bone
+                 if not target_bone and context.selected_pose_bones:
+                     target_bone = context.selected_pose_bones[0]
             
-            if obj.mode == 'POSE' and target_bone:
-                 if any(is_location_fcurve(fc, target_bone.name) for fc in get_fcurves(action)):
-                     should_calculate_path = True
-            else:
-                 if any(is_location_fcurve(fc) for fc in get_fcurves(action)):
-                     should_calculate_path = True
-            
-            if should_calculate_path:
-                # Reuse Fast Path check for Object Mode
-                use_fast_path_line = False
-                if obj.mode == 'OBJECT':
-                    has_constraints = bool(obj.constraints)
-                    has_drivers = False
-                    if obj.animation_data and obj.animation_data.drivers:
-                        for d in obj.animation_data.drivers:
-                            if 'location' in d.data_path:
-                                has_drivers = True
-                                break
-                    use_fast_path_line = not (has_constraints or has_drivers)
-
-                if use_fast_path_line:
-                    # FAST PATH for Line
-                    frames_range = range(frame_start, frame_end + 1)
-                    path_data = calculate_path_from_fcurves(obj, action, frames_range)
-                    # Convert dict to list sorted by frame
-                    path_points = [path_data[f]['position'] for f in frames_range]
+            if (obj.mode == 'OBJECT') or (obj.mode == 'POSE' and target_bone):
+                # Optimization: Only calculate path if there are location fcurves
+                should_calculate_path = False
+                
+                if obj.mode == 'POSE' and target_bone:
+                     if any(is_location_fcurve(fc, target_bone.name) for fc in get_fcurves(action)):
+                         should_calculate_path = True
                 else:
-                    # SLOW PATH for Line (and Bone Mode)
-                    for f in range(frame_start, frame_end + 1):
-                        context.scene.frame_set(f)
-                        view_layer.update() # Ensure matrices are updated
-                        
-                        if obj.mode == 'POSE' and target_bone:
-                            # Bone location in Local Basis Space
-                            pos = target_bone.matrix_basis.translation.copy()
-                        else:
-                            # Object location in Local Basis Space
-                            pos = obj.matrix_basis.translation.copy()
-                        path_points.append(pos)
-        
-        _state.path_vertices = path_points
-        if path_points:
-            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-            _state.path_batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": path_points})
-
-    context.scene.frame_current = current_frame
-    view_layer.update()
+                     if any(is_location_fcurve(fc) for fc in get_fcurves(action)):
+                         should_calculate_path = True
+                
+                if should_calculate_path:
+                    # FAST PATH for path line — always read F-Curves directly.
+                    # No frame_set; no scene state is touched.
+                    target_bone_name = target_bone.name if (obj.mode == 'POSE' and target_bone) else None
+                    frames_range = range(frame_start, frame_end + 1)
+                    path_data = calculate_path_from_fcurves(obj, action, frames_range, bone_name=target_bone_name)
+                    path_points = [path_data[f]['position'] for f in frames_range]
+            
+            _state.path_vertices = path_points
+            if path_points:
+                shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+                _state.path_batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": path_points})
+    
+    finally:
+        _is_updating_cache = False
 
 def get_current_parent_matrix(context, obj, bone=None):
     """
-    Unified calculation of the parent matrix (Coordinate Space for F-Curves).
-    Formula: Parent_Matrix = Final_World_Matrix @ Local_Basis_Matrix.inverted()
+    Unified calculation of the parent matrix (from cached-position space to world space).
+
+    OBJECT mode:
+      Positions are stored in 'parent-local' space (post-constraint world position for
+      unparented objects, or post-constraint position relative to parent for parented
+      objects). The correct transform to world space is therefore:
+        - Unparented  → Identity  (positions ARE world positions)
+        - Parented    → obj.parent.matrix_world  (parent's current world matrix)
+      This avoids baking the object's own constraint effects (rotation, scale) into
+      the parent matrix, which was the root cause of paths appearing to rotate when a
+      rotation-only constraint (e.g. Damped Track) was active.
+
+    POSE (bone) mode:
+      Bone positions are stored in bone matrix_basis space (local translation offset
+      driven by F-Curves). The parent matrix converts this to world space via:
+          obj.matrix_world @ bone.parent.matrix @ bone.bone.matrix_local  (child bone)
+          obj.matrix_world @ bone.bone.matrix_local                       (root bone)
+      bone.bone.matrix_local is the REST-pose local matrix — unaffected by constraints.
+      bone.parent.matrix is the parent's current POSE matrix — correctly reflects the
+      animated parent chain while excluding this bone's own constraint effects.
+      This mirrors the Object-mode fix: constraint effects on THIS bone cannot rotate
+      or distort the displayed path.
+      Also used for drag operations: parent_matrix.to_3x3().inverted() converts a
+      world-space mouse offset to the F-Curve local space, giving correct drag direction
+      even for bones with rotation constraints.
     """
     if obj.mode == 'POSE' and bone:
-        # Bone Logic
-        # bone.matrix is in Object Space (including constraints)
-        # bone.matrix_basis is Local Space (relative to parent, what F-Curves drive)
-        final_world_matrix = obj.matrix_world @ bone.matrix
-        local_matrix = bone.matrix_basis
+        # Bone Logic: derive parent matrix from the parent chain, NOT from this bone's
+        # own final matrix.  Using bone.matrix (post-constraint) here produces the same
+        # "spurious rotation residual" as the old object-mode formula did — the bone's
+        # own rotation constraint (Damped Track, Look At, etc.) would contaminate the
+        # parent matrix and make the displayed path appear rotated.
+        #
+        # Correct formula:
+        #   parent_matrix = armature_world × parent_bone_pose × this_bone_rest_local
+        #
+        # bone.bone.matrix_local  = bone's 4x4 REST-pose matrix in armature local space
+        #                           (independent of constraints, stable across frames).
+        # bone.parent.matrix      = parent bone's POSE matrix in armature space
+        #                           (includes parent's own constraints — correct, because
+        #                           the parent's animated state defines the child's space).
+        if bone.parent:
+            return obj.matrix_world @ bone.parent.matrix @ bone.bone.matrix_local
+        else:
+            # Root bone: armature world matrix × bone's rest matrix in armature space.
+            return obj.matrix_world @ bone.bone.matrix_local
     else:
-        # Object Logic
-        final_world_matrix = obj.matrix_world
-        # obj.matrix_basis is Local Space (relative to parent, what F-Curves drive)
-        # Fallback to matrix_local if basis is not available (though basis is standard in modern Blender)
-        local_matrix = obj.matrix_basis 
-
-    # Safe Inversion to handle potential singular matrices (e.g. scale 0)
-    try:
-        local_inverted = local_matrix.inverted()
-    except ValueError:
-        # Fallback for singular matrix
-        local_inverted = mathutils.Matrix.Identity(4)
-
-    return final_world_matrix @ local_inverted
+        # Object Logic: derive from parent hierarchy directly.
+        # Do NOT use matrix_world @ matrix_basis.inverted() here — that formula breaks
+        # whenever a constraint (e.g. Damped Track) changes the object's rotation or
+        # scale, because matrix_world then contains constraint effects that are absent
+        # from matrix_basis, leaving a spurious rotation residual in the result.
+        if obj.parent is None:
+            # Unparented: F-Curve values / world positions are already in world space.
+            return mathutils.Matrix.Identity(4)
+        else:
+            parent_mat = obj.parent.matrix_world.copy()
+            # If parented to a specific bone, include that bone's transform.
+            if obj.parent_type == 'BONE' and obj.parent_bone:
+                if obj.parent.pose and obj.parent_bone in obj.parent.pose.bones:
+                    pb = obj.parent.pose.bones[obj.parent_bone]
+                    parent_mat = obj.parent.matrix_world @ pb.matrix
+            return parent_mat
 
 class DrawCollector:
     def __init__(self):
@@ -559,6 +607,14 @@ class DrawCollector:
         self.circles = {} # (radius, color) -> [pos]
 
     def add_line(self, p1, p2, color):
+        try:
+            # Validate points to prevent GPU driver crash
+            if not (math.isfinite(p1[0]) and math.isfinite(p1[1]) and math.isfinite(p1[2]) and
+                    math.isfinite(p2[0]) and math.isfinite(p2[1]) and math.isfinite(p2[2])):
+                return
+        except:
+            return
+
         self.lines.append(p1)
         self.lines.append(p2)
         self.line_colors.append(color)
@@ -590,6 +646,14 @@ class DrawCollector:
                 shader = gpu.shader.from_builtin('SMOOTH_COLOR')
                 batch = batch_for_shader(shader, 'LINES', {"pos": self.lines, "color": self.line_colors})
                 shader.bind()
+                
+                # Explicitly set line width for handles to prevent inheriting path width
+                wm = context.window_manager
+                if hasattr(wm, 'motion_path_styles'):
+                    gpu.state.line_width_set(wm.motion_path_styles.handle_line_width)
+                else:
+                    gpu.state.line_width_set(2.0)
+                    
                 batch.draw(shader)
             except Exception as e:
                 print(f"Error drawing lines batch: {e}")
@@ -635,11 +699,26 @@ def draw_motion_path_overlay():
 
         # Draw the continuous path line first
         if wm.custom_path_draw_active and _state.path_vertices:
-            # Transform local vertices to world
-            raw_world_points = [parent_matrix @ v for v in _state.path_vertices]
-            
-            # Validate points to prevent GPU crash (Access Violation)
-            world_points = [p for p in raw_world_points if all(math.isfinite(c) and abs(c) < SAFE_LIMIT for c in p)]
+            # Transform local vertices to world and validate explicitly
+            # Replaces list comprehension to avoid Python 3.11/Vulkan crash (PyTuple_GetItem)
+            world_points = []
+            for v in _state.path_vertices:
+                try:
+                    # Transform
+                    p = parent_matrix @ v
+                    
+                    # Explicit validation without using all() generator or implicit iteration
+                    # Access components by index directly
+                    px = p[0]
+                    py = p[1]
+                    pz = p[2]
+                    
+                    if (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
+                        abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
+                        # Convert to pure tuple for GPU safety
+                        world_points.append((px, py, pz))
+                except:
+                    continue
             
             shader = gpu.shader.from_builtin('UNIFORM_COLOR')
             
@@ -913,6 +992,61 @@ def disable_draw_handler():
         bpy.types.SpaceView3D.draw_handler_remove(_state.draw_handler, 'WINDOW')
         _state.draw_handler = None
 
+@persistent
+def on_depsgraph_update(scene, depsgraph):
+    """Smart update handler for motion paths"""
+    global _state, _is_updating_cache
+    
+    # 1. Check Recursion Lock (Fast Path)
+    # We still check here to avoid overhead of function call,
+    # even though build_position_cache handles it too.
+    if _is_updating_cache:
+        return
+
+    # 2. Check Dragging State (Conflict Resolution)
+    # If operator is handling it, we do nothing.
+    if _state.is_dragging or _state.handle_dragging:
+        return
+
+    wm = bpy.context.window_manager
+    if not wm.custom_path_draw_active or wm.motion_path_update_mode != 'SMART':
+        return
+
+    # Check if we need to update
+    # We care about Object transforms and Action data
+    is_object_updated = depsgraph.id_type_updated('OBJECT')
+    is_action_updated = depsgraph.id_type_updated('ACTION')
+    
+    if is_object_updated or is_action_updated:
+        # Check if animation is playing to avoid heavy load during playback
+        if bpy.context.screen and bpy.context.screen.is_animation_playing:
+            return
+
+        try:
+            # Only update if there is an active object
+            if bpy.context.active_object:
+                # Detect Interaction: Object updated but Action (keyframes) did not.
+                # This usually means the user is moving the object (G/Gizmo) but hasn't keyed it yet.
+                is_interaction_update = is_object_updated and not is_action_updated
+                
+                # If we are in interaction mode, SKIP calculation entirely.
+                # This reuses the existing cache (old path) for both Fast and Slow paths,
+                # ensuring smooth object movement without lag or state resets.
+                if is_interaction_update:
+                    return
+
+                # No need to manage lock manually here anymore.
+                # build_position_cache handles atomic locking internally.
+                build_position_cache(bpy.context)
+                
+                # Tag redraw for all 3D views
+                for window in wm.windows:
+                    for area in window.screen.areas:
+                        if area.type == 'VIEW_3D':
+                            area.tag_redraw()
+        except Exception as e:
+            print(f"Error in smart update: {e}")
+
 class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
     """Auto update motion paths when change keyframes"""
     bl_idname = "motion_path.auto_update_motion_paths"
@@ -932,28 +1066,46 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         wm = context.window_manager
         self._last_keyframe_values = self._get_keyframe_values(context)
         self._needs_update = False
-        if wm.update_hamdionz == 'TIMER':
-            self._timer = wm.event_timer_add(wm.auto_midawq_timer_interval, window=context.window)
+        
+        # Register Smart Handler
+        if on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(on_depsgraph_update)
+            
+        # Setup Timer for Timer Mode
+        # We always create a timer to handle mode switching dynamically, 
+        # but we only act on it if in TIMER mode.
+        # Use auto_update_fps to calculate interval
+        interval = 1.0 / max(1, wm.auto_update_fps)
+        self._timer = wm.event_timer_add(interval, window=context.window)
+        
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
     
     def modal(self, context, event):
         wm = context.window_manager
-        current_values = self._get_keyframe_values(context)
         
-        if wm.update_hamdionz == 'TIMER' and event.type == 'TIMER':
+        # Check bone selection changes (runs in both modes as it's selection based)
+        current_bone_selection = self._get_bone_selection_state(context)
+        if not hasattr(self, '_last_bone_selection'):
+            self._last_bone_selection = current_bone_selection
+        
+        if current_bone_selection != self._last_bone_selection:
+            self._last_bone_selection = current_bone_selection
+            self._needs_update = True
+        
+        # TIMER Mode Logic
+        if wm.motion_path_update_mode == 'TIMER' and event.type == 'TIMER':
+            current_values = self._get_keyframe_values(context)
             if current_values != self._last_keyframe_values:
                 self._needs_update = True
-        elif wm.update_hamdionz == 'EVENT':
-            if current_values != self._last_keyframe_values or self._has_selected_keyframes_changed(context):
-                self._needs_update = True
-        
+                self._last_keyframe_values = current_values
+                
+        # Handle Updates
         if self._needs_update:
             try:
                 build_position_cache(context)
             except Exception as e:
                 print("Error updating position cache:", e)
-            self._last_keyframe_values = current_values
             self._needs_update = False
             if context.area and context.area.type == 'VIEW_3D':
                 context.area.tag_redraw()
@@ -969,6 +1121,10 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         if self._timer:
             wm.event_timer_remove(self._timer)
             self._timer = None
+            
+        # Remove Smart Handler
+        if on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(on_depsgraph_update)
     
     def _collect_object_keyframes(self, obj):
         if not obj or not obj.animation_data or not obj.animation_data.action:
@@ -1002,6 +1158,17 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
             parent = parent.parent
             
         return tuple(all_values) if all_values else None
+    
+    def _get_bone_selection_state(self, context):
+        """Get current bone selection state"""
+        active_object = context.active_object
+        if not active_object or active_object.mode != 'POSE':
+            return None
+            
+        active_bone_name = context.active_pose_bone.name if context.active_pose_bone else None
+        selected_bone_names = tuple(sorted([b.name for b in context.selected_pose_bones])) if context.selected_pose_bones else ()
+        
+        return (active_bone_name, selected_bone_names)
     
     def _has_selected_keyframes_changed(self, context):
         """Check the status of selected keyframe"""
@@ -1062,13 +1229,13 @@ class MOTIONPATH_DirectManipulationToggle(bpy.types.Operator):
             bpy.ops.motion_path.direct_manipulation('INVOKE_DEFAULT')
             wm.auto_sapty_active = True
             bpy.ops.motion_path.auto_update_motion_paths('INVOKE_DEFAULT')
-            self.report({'INFO'}, "Enable Direct Path Editing")
+            self.report({'INFO'}, iface_("Enable Direct Path Editing"))
         else:
             wm.direct_manipulation_active = False
             wm.auto_sapty_active = False
             if context.area:
                 context.area.tag_redraw()
-            self.report({'INFO'}, "Disable Direct Path Editing")
+            self.report({'INFO'}, iface_("Disable Direct Path Editing"))
         
         return {'FINISHED'}
 
@@ -1144,6 +1311,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         self._is_active = False
         self._redraw_count = 0
         self._last_frame = None
+        self._last_draw_time = 0.0
     
     def convert_vector_handles_to_free(self, keyframes_for_location):
         """Convert vector handles to free handles to allow editing"""
@@ -1173,16 +1341,19 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         if not wm.direct_manipulation_active or not self._is_active:
             return self.cancel(context)
         
-        obj = context.active_object
-        if obj and obj.type == 'ARMATURE' and obj.mode == 'OBJECT' and wm.direct_manipulation_active:
-            self.report({'INFO'}, "Motion Path Editing disabled in Object Mode for armature")
-            wm.direct_manipulation_active = False
-            wm.auto_sapty_active = False
-            self.cancel(context)
-            return {'CANCELLED'}
+        # REMOVED: Hardcoded block for Armature Object Mode
+        # We now rely on hit-testing below to decide whether to intercept or pass through.
+        # This fixes the issue where Armature objects could not have their motion paths edited in Object Mode.
         
         if event.type == 'MOUSEMOVE':
             self._mouse_pos = (event.mouse_region_x, event.mouse_region_y)
+            
+            # FPS Limiting
+            target_interval = 1.0 / max(1, wm.motion_path_fps_limit)
+            current_time = time.time()
+            if (current_time - self._last_draw_time) < target_interval:
+                return {'PASS_THROUGH'}
+            self._last_draw_time = current_time
             
             # Use manual region finding to ensure we are interacting with the correct 3D View
             region, space_data, local_mouse_pos = find_region_under_mouse(context, event)
@@ -1228,15 +1399,13 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                      self.move_selected_points(context, offset)
                      _state.drag_start_3d = new_3d_pos
                 
-                self._redraw_count += 1
-                
                 # Update path line in real-time
                 try:
                     build_position_cache(context)
                 except:
                     pass
 
-                if self._redraw_count % 3 == 0 and context.area and context.area.type == 'VIEW_3D':
+                if context.area and context.area.type == 'VIEW_3D':
                     context.area.tag_redraw()
                     
             elif _state.handle_dragging and _state.selected_handle_point is not None:
@@ -1260,8 +1429,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 except:
                     pass
 
-                self._redraw_count += 1
-                if self._redraw_count % 3 == 0 and context.area and context.area.type == 'VIEW_3D':
+                if context.area and context.area.type == 'VIEW_3D':
                     context.area.tag_redraw()
                     
             return {'PASS_THROUGH'}
@@ -1441,7 +1609,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     
             elif event.value == 'RELEASE':
                 if _state.is_dragging:
-                    bpy.ops.ed.undo_push(message="Move Motion Path Points")
+                    bpy.ops.ed.undo_push(message=iface_("Move Motion Path Points"))
                     _state.is_dragging = False
                     _state.selected_path_point = None
                     _state.selected_frame = None
@@ -1457,7 +1625,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                         context.area.tag_redraw()
                     return {'RUNNING_MODAL'}
                 elif _state.handle_dragging:
-                    bpy.ops.ed.undo_push(message="Move Motion Path Handle")
+                    bpy.ops.ed.undo_push(message=iface_("Move Motion Path Handle"))
                     _state.handle_dragging = False
                     _state.selected_handle_point = None
                     _state.drag_start_item_pos = None
@@ -1479,7 +1647,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 context.area.tag_redraw()
             return {'PASS_THROUGH'}
         
-        
+        # Explicitly pass through all other events (G, R, S, etc.)
+        # This ensures we don't block standard Blender tools when not interacting with the path
         return {'PASS_THROUGH'}
     
     def invoke(self, context, event):
@@ -1491,7 +1660,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             enable_draw_handler(context)
             return {'RUNNING_MODAL'}
         else:
-            self.report({'WARNING'}, "View3D not found, cannot run operator")
+            self.report({'WARNING'}, iface_("View3D not found, cannot run operator"))
             return {'CANCELLED'}
     
     def cancel(self, context):
@@ -2101,7 +2270,7 @@ class MOTIONPATH_ToggleCustomDraw(bpy.types.Operator):
                      break
              
              if not found_view3d:
-                 self.report({'WARNING'}, "Enabled Motion Path, but no 3D View found for interaction.")
+                 self.report({'WARNING'}, iface_("Enabled Motion Path, but no 3D View found for interaction."))
         else:
             # Disabling
             wm.direct_manipulation_active = False
@@ -2136,20 +2305,36 @@ class MotionPathStyleSettings(bpy.types.PropertyGroup):
     handle_endpoint_color: bpy.props.FloatVectorProperty(name="Handle Endpoint Color", subtype='COLOR', size=4, default=(0.953, 0.78, 0.0, 1.0), min=0.0, max=1.0)
     selected_handle_endpoint_color: bpy.props.FloatVectorProperty(name="Selected Handle Endpoint Color", subtype='COLOR', size=4, default=(1.0, 0.102, 0.0, 1.0), min=0.0, max=1.0)
 
-class MOTIONPATH_CustomDrawPanel(bpy.types.Panel):
-    bl_label = 'Motion Path Pro'
-    bl_idname = 'VIEW3D_PT_motion_path_custom'
+class MOTIONPATH_PT_header_settings(bpy.types.Panel):
+    bl_label = "Motion Path Settings"
+    bl_idname = "MOTIONPATH_PT_header_settings"
     bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Motion Path'
-    
+    bl_region_type = 'HEADER'
+
+    def draw(self, context):
+        layout = self.layout
+        wm = context.window_manager
+        
+        layout.label(text=iface_("Performance"))
+        
+        layout.label(text=iface_("Update Mode"))
+        row = layout.row()
+        row.prop(wm, "motion_path_update_mode", expand=True)
+        
+        layout.prop(wm, "motion_path_fps_limit", text=iface_("Interaction FPS"))
+        if wm.motion_path_update_mode == 'TIMER':
+            layout.prop(wm, "auto_update_fps", text=iface_("Auto Update FPS"))
+
+class MOTIONPATH_AddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
     def draw(self, context):
         layout = self.layout
         wm = context.window_manager
         styles = wm.motion_path_styles
         
         col = layout.column()
-        col.label(text="Style Settings")
+        col.label(text=iface_("Style Settings"))
         col.prop(styles, "path_width")
         col.prop(styles, "path_color")
         
@@ -2160,13 +2345,13 @@ class MOTIONPATH_CustomDrawPanel(bpy.types.Panel):
             col.prop(styles, "frame_point_color")
             
         col.separator()
-        col.label(text="Keyframes")
+        col.label(text=iface_("Keyframes"))
         col.prop(styles, "keyframe_point_size")
         col.prop(styles, "keyframe_point_color")
         col.prop(styles, "selected_keyframe_point_color")
         
         col.separator()
-        col.label(text="Handles")
+        col.label(text=iface_("Handles"))
         col.prop(styles, "handle_line_width")
         col.prop(styles, "handle_line_color")
         col.prop(styles, "selected_handle_line_color")
@@ -2180,11 +2365,11 @@ class MOTIONPATH_MT_context_menu(bpy.types.Menu):
 
     def draw(self, context):
         layout = self.layout
-        layout.operator("motion_path.set_handle_type", text="Free").handle_type = 'FREE'
-        layout.operator("motion_path.set_handle_type", text="Aligned").handle_type = 'ALIGNED'
-        layout.operator("motion_path.set_handle_type", text="Vector").handle_type = 'VECTOR'
-        layout.operator("motion_path.set_handle_type", text="Auto").handle_type = 'AUTO'
-        layout.operator("motion_path.set_handle_type", text="Auto Clamped").handle_type = 'AUTO_CLAMPED'
+        layout.operator("motion_path.set_handle_type", text=iface_("Free")).handle_type = 'FREE'
+        layout.operator("motion_path.set_handle_type", text=iface_("Aligned")).handle_type = 'ALIGNED'
+        layout.operator("motion_path.set_handle_type", text=iface_("Vector")).handle_type = 'VECTOR'
+        layout.operator("motion_path.set_handle_type", text=iface_("Auto")).handle_type = 'AUTO'
+        layout.operator("motion_path.set_handle_type", text=iface_("Auto Clamped")).handle_type = 'AUTO_CLAMPED'
 
 def ensure_location_keyframes(context, obj):
     """
@@ -2327,12 +2512,15 @@ def update_custom_path_active(self, context):
 def draw_header_button(self, context):
     layout = self.layout
     wm = context.window_manager
-    layout.prop(wm, "custom_path_draw_active", text="", icon='IPO_BEZIER', toggle=True)
+    row = layout.row(align=True)
+    row.prop(wm, "custom_path_draw_active", text="", icon='IPO_BEZIER', toggle=True)
+    row.popover(panel="MOTIONPATH_PT_header_settings", text="")
 
 classes = (
     MOTIONPATH_ToggleCustomDraw,
     MotionPathStyleSettings,
-    MOTIONPATH_CustomDrawPanel,
+    MOTIONPATH_PT_header_settings,
+    MOTIONPATH_AddonPreferences,
     MOTIONPATH_MT_context_menu,
     
     MOTIONPATH_DirectManipulation,
@@ -2341,7 +2529,21 @@ classes = (
     MOTIONPATH_SetHandleType,
 )
 
+motion_path_update_mode_items = [
+    ('SMART', "Smart (Event)", "Update only when relevant data changes (Zero idle power)"),
+    ('TIMER', "Timer (Polling)", "Update periodically (Stable but higher power)")
+]
+
+handle_type_items = [
+    ('FREE', "Free", "Handles can be adjusted independently"),
+    ('ALIGNED', "Aligned", "Handles are aligned to maintain smoothness"),
+    ('VECTOR', "Vector", "Creates linear interpolation"),
+    ('AUTO', "Auto", "Automatic smooth handles"),
+    ('AUTO_CLAMPED', "Auto Clamped", "Automatic handles with clamped values"),
+]
+
 def register():
+    translations.register(__package__)
     for cls in classes:
         bpy.utils.register_class(cls)
     
@@ -2363,32 +2565,35 @@ def register():
         name="Auto Update Active",
         default=False
     )
-    bpy.types.WindowManager.auto_midawq_timer_interval = bpy.props.FloatProperty(
-        name="Timer Interval",
-        description="Interval in seconds for auto-update timer",
-        default=0.1,
-        min=0.05,
-        max=1.0
+    
+    # Performance Settings
+    bpy.types.WindowManager.motion_path_fps_limit = bpy.props.IntProperty(
+        name="Max FPS Limit",
+        description="Limit the frame rate of interaction and redrawing to save power",
+        default=60,
+        min=1,
+        max=144
     )
-    bpy.types.WindowManager.update_hamdionz = bpy.props.EnumProperty(
+    
+    bpy.types.WindowManager.motion_path_update_mode = bpy.props.EnumProperty(
         name="Update Mode",
-        description="Update mode",
-        items=[
-            ('TIMER', "Real-time", "Update continuously (resource intensive)"),
-            ('EVENT', "On Change", "Update only when keyframes change")
-        ],
-        default='TIMER'
+        description="Choose how the motion path updates",
+        items=motion_path_update_mode_items,
+        default='SMART'
     )
+    
+    bpy.types.WindowManager.auto_update_fps = bpy.props.IntProperty(
+        name="Auto Update FPS",
+        description="Frequency of checks in Timer mode (Hz)",
+        default=10,
+        min=1,
+        max=60
+    )
+    
     bpy.types.WindowManager.handle_type = bpy.props.EnumProperty(
         name="Handle Type",
         description="Default handle type for new keyframes",
-        items=[
-            ('FREE', "Free", "Handles can be adjusted independently"),
-            ('ALIGNED', "Aligned", "Handles are aligned to maintain smoothness"),
-            ('VECTOR', "Vector", "Creates linear interpolation"),
-            ('AUTO', "Auto", "Automatic smooth handles"),
-            ('AUTO_CLAMPED', "Auto Clamped", "Automatic handles with clamped values"),
-        ],
+        items=handle_type_items,
         default='ALIGNED'
     )
     bpy.types.WindowManager.handle_snap = bpy.props.BoolProperty(
@@ -2427,9 +2632,12 @@ def unregister():
     del bpy.types.WindowManager.custom_path_draw_active
     del bpy.types.WindowManager.direct_manipulation_active
     del bpy.types.WindowManager.auto_sapty_active
-    del bpy.types.WindowManager.auto_midawq_timer_interval
-    del bpy.types.WindowManager.update_hamdionz
+    del bpy.types.WindowManager.motion_path_fps_limit
+    del bpy.types.WindowManager.motion_path_update_mode
+    del bpy.types.WindowManager.auto_update_fps
     del bpy.types.WindowManager.handle_type
     del bpy.types.WindowManager.handle_snap
     del bpy.types.WindowManager.handle_snap_increment
     del bpy.types.WindowManager.global_handle_visual_scale
+    
+    translations.unregister(__package__)

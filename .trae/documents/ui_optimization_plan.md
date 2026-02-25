@@ -1,42 +1,34 @@
-# Motion Path Pro UI 优化计划
+# 界面优化计划：头部下拉菜单与性能设置迁移
 
-根据您的需求，我们将对插件的 UI 进行以下优化：
+根据您的需求，我们将对插件的 UI 进行改进，在 3D 视图头部添加带下拉菜单的按钮，并将性能设置移动到该菜单中。
 
-## 1. 移动插件开关至播放控制台
-将插件的"开启/关闭"按钮从侧边栏移动到时间线（Dope Sheet）和曲线编辑器（Graph Editor）的头部播放控制台区域。
+## 1. 定义下拉菜单面板
+我们需要创建一个新的面板类，它将作为下拉菜单（Popover）的内容显示。
 
-## 2. 优化手柄显示逻辑
-- 移除 "Show All Handles" 和 "Show Selected Only" 选项。
-- 强制默认为：**仅显示选中关键帧的手柄**。
+- **类名**: `MOTIONPATH_PT_header_settings`
+- **功能**: 承载原本位于侧边栏的 "Performance" 设置项。
+- **包含内容**:
+  - Update Mode (更新模式)
+  - Interaction FPS (交互帧率)
+  - Auto Update FPS (自动更新帧率 - 仅在 Timer 模式下显示)
 
-## 3. 右键菜单更改手柄类型
-- 在 3D 视图中，当用户右键点击关键帧点时，弹出上下文菜单。
-- 菜单中包含更改手柄类型（Free, Aligned, Vector, Auto 等）的选项。
-- 移除原面板中的下拉菜单。
+## 2. 修改头部按钮绘制
+修改 `draw_header_button` 函数，将其改为组合按钮样式。
 
-## 4. 简化侧边栏面板
-- **3D 视图侧边栏**：移除除 "Style Settings" 以外的所有内容。
-- **曲线编辑器侧边栏**：完全移除插件面板。
+- **布局**: 使用 `layout.row(align=True)` 让按钮紧密排列。
+- **左侧**: 原有的插件开关按钮 (`custom_path_draw_active`)。
+- **右侧**: 新增的下拉菜单按钮 (`popover`)，指向 `MOTIONPATH_PT_header_settings`。
 
-## 执行步骤
+## 3. 清理原有侧边栏面板
+修改 `MOTIONPATH_CustomDrawPanel` 类。
 
-1.  **修改手柄绘制逻辑**：
-    - 在 `draw_motion_path_point` 函数中，修改判断条件，仅当 `is_selected_keyframe` 为真时绘制手柄。
+- **操作**: 删除其中的 "Performance" 设置部分，因为这些功能已经移动到了头部下拉菜单中。
 
-2.  **创建右键菜单类**：
-    - 定义 `MOTIONPATH_MT_context_menu` 类，包含各类手柄类型的设置按钮。
+## 4. 注册新组件
+确保新创建的 `MOTIONPATH_PT_header_settings` 类被添加到注册列表中。
 
-3.  **更新交互逻辑 (Modal Operator)**：
-    - 在 `MOTIONPATH_DirectManipulation` 的 `modal` 方法中添加对 `RIGHTMOUSE` 事件的处理。
-    - 当右键点击路径点时，选中该点并调用 `wm.call_menu` 弹出右键菜单。
+---
 
-4.  **调整 UI 面板注册**：
-    - 定义 `draw_header` 函数，将开关按钮绘制到 `DOPESHEET_HT_header` 和 `GRAPH_HT_header`。
-    - 修改 `MOTIONPATH_CustomDrawPanel`，仅保留样式设置内容。
-    - 删除 `MOTIONPATH_CustomDrawGraphPanel` 类及其注册代码。
-    - 清理不再需要的 `WindowManager` 属性（如 `show_all_handles` 等）。
-
-5.  **验证与测试**：
-    - 验证按钮是否出现在播放控制台。
-    - 验证右键菜单是否正常弹出并生效。
-    - 验证手柄是否仅在选中时显示。
+## 预期效果
+- **3D 视图头部**: 插件图标旁会出现一个小箭头或设置图标，点击可展开性能设置菜单。
+- **侧边栏 (N 面板)**: "Motion Path Pro" 面板将不再显示 Performance 区域，变得更加简洁。
