@@ -3,7 +3,7 @@ bl_info = {
     "author" : "Hamdi Amer", 
     "description" : "Update motion path in real time from graph editor and viewport",
     "blender" : (5, 0, 0),
-    "version" : (2, 0, 1),
+    "version" : (2, 1, 0),
     "location" : "Graph Editor",
     "warning" : "",
     "doc_url": "", 
@@ -14,8 +14,6 @@ bl_info = {
 
 
 import bpy
-import bpy_extras
-import bpy_extras.view3d_utils
 import mathutils
 import math
 import gpu
@@ -24,11 +22,8 @@ import time
 from bpy.app.handlers import persistent
 from gpu_extras.batch import batch_for_shader
 from bpy_extras import view3d_utils
-from bpy.app.translations import pgettext_iface
-
-def iface_(msg):
-    return pgettext_iface(msg)
-from . import translations  
+from bpy.app.translations import pgettext_iface as iface_
+from . import translations
 
 
 class MotionPathState:
@@ -48,9 +43,7 @@ class MotionPathState:
         self.position_cache = {}
         self.initial_handle_values = {}  # Store initial handle values for drag: {(frame, array_index): value}
         self.draw_handler = None
-        
-        # New: Path Drawing Data
-        self.path_vertices = [] 
+        self.path_vertices = []
         self.path_batch = None
         
     def reset(self):
@@ -63,7 +56,6 @@ _state = MotionPathState()
 _is_updating_cache = False
 
 
-HANDLE_SIZE = 10
 HANDLE_SELECT_RADIUS = 20
 SAFE_LIMIT = 1000000.0
 
@@ -78,7 +70,7 @@ def get_fcurves(action):
         slot = action.slots[0]
         channelbag = strip.channelbag(slot, ensure=True)
         return channelbag.fcurves
-    except:
+    except Exception:
         return []
 
 def get_billboard_basis(context):
@@ -97,7 +89,7 @@ def get_billboard_basis(context):
             return None, None
             
         return right, up
-    except:
+    except Exception:
         return None, None
 
 def get_pixel_scale(context, pos, pixel_size):
@@ -134,7 +126,7 @@ def draw_billboard_circle(context, pos, radius_in_pixels, color, shader):
         if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and 
                 abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
             return
-    except:
+    except Exception:
         return
 
     right, up = get_billboard_basis(context)
@@ -145,7 +137,7 @@ def draw_billboard_circle(context, pos, radius_in_pixels, color, shader):
     try:
         rx, ry, rz = right[0], right[1], right[2]
         ux, uy, uz = up[0], up[1], up[2]
-    except:
+    except Exception:
         return
 
     scale = get_pixel_scale(context, pos, radius_in_pixels)
@@ -170,7 +162,7 @@ def draw_billboard_circle(context, pos, radius_in_pixels, color, shader):
                     abs(vx) < SAFE_LIMIT and abs(vy) < SAFE_LIMIT and abs(vz) < SAFE_LIMIT):
                 return
             vertices.append((vx, vy, vz))
-    except:
+    except Exception:
         return
 
     batch = batch_for_shader(shader, 'TRI_FAN', {"pos": vertices})
@@ -184,7 +176,7 @@ def draw_billboard_square(context, pos, half_size_in_pixels, color, shader):
         if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and 
                 abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
             return
-    except:
+    except Exception:
         return
 
     right, up = get_billboard_basis(context)
@@ -195,7 +187,7 @@ def draw_billboard_square(context, pos, half_size_in_pixels, color, shader):
     try:
         rx, ry, rz = right[0], right[1], right[2]
         ux, uy, uz = up[0], up[1], up[2]
-    except:
+    except Exception:
         return
 
     scale = get_pixel_scale(context, pos, half_size_in_pixels)
@@ -224,7 +216,7 @@ def draw_billboard_square(context, pos, half_size_in_pixels, color, shader):
             if not (math.isfinite(v[0]) and math.isfinite(v[1]) and math.isfinite(v[2]) and 
                     abs(v[0]) < SAFE_LIMIT and abs(v[1]) < SAFE_LIMIT and abs(v[2]) < SAFE_LIMIT):
                 return
-    except:
+    except Exception:
         return
             
     indices = ((0, 1, 2), (0, 2, 3))
@@ -244,7 +236,7 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
     try:
         rx, ry, rz = right[0], right[1], right[2]
         ux, uy, uz = up[0], up[1], up[2]
-    except:
+    except Exception:
         return
     
     # Precompute unit circle (pure floats)
@@ -269,7 +261,7 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
             safe_color = (safe_color[0], safe_color[1], safe_color[2], 1.0)
         elif len(safe_color) != 4:
             safe_color = (1.0, 1.0, 1.0, 1.0) # Fallback
-    except:
+    except Exception:
         safe_color = (1.0, 1.0, 1.0, 1.0)
 
     for i in range(0, total_points, BATCH_SIZE):
@@ -284,7 +276,7 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
                 # Validate and unpack pos
                 try:
                     px, py, pz = pos[0], pos[1], pos[2]
-                except:
+                except Exception:
                     continue
 
                 if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and 
@@ -612,7 +604,7 @@ class DrawCollector:
             if not (math.isfinite(p1[0]) and math.isfinite(p1[1]) and math.isfinite(p1[2]) and
                     math.isfinite(p2[0]) and math.isfinite(p2[1]) and math.isfinite(p2[2])):
                 return
-        except:
+        except Exception:
             return
 
         self.lines.append(p1)
@@ -663,11 +655,25 @@ class DrawCollector:
         for (radius, color), points in self.circles.items():
             draw_batched_billboard_circles(context, points, radius, color, shader)
 
+def _build_ring_vertices(px, py, pz, scale, rx, ry, rz, ux, uy, uz, segments=32):
+    """Build a list of 3D vertex tuples forming a screen-aligned ring."""
+    verts = []
+    for i in range(segments):
+        angle = 2 * math.pi * i / segments
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        verts.append((
+            px + scale * (cos_a * rx + sin_a * ux),
+            py + scale * (cos_a * ry + sin_a * uy),
+            pz + scale * (cos_a * rz + sin_a * uz),
+        ))
+    return verts
+
+
 def draw_origin_indicator(context, obj, bone, styles):
     """Draw an origin indicator for the active object/bone on top of the motion path."""
     try:
         if bone is not None:
-            # Pose mode: world position of the bone head via matrix_world @ bone.matrix
             world_pos = (obj.matrix_world @ bone.matrix).translation
         else:
             world_pos = obj.matrix_world.translation
@@ -692,57 +698,25 @@ def draw_origin_indicator(context, obj, bone, styles):
         if style == 'DOT':
             draw_billboard_circle(context, pos, outer_size / 2, inner_color, shader)
 
-        elif style == 'RING':
+        elif style in {'RING', 'RING_DOT'}:
             right, up = get_billboard_basis(context)
             if right is None or up is None:
                 return
             scale = get_pixel_scale(context, pos, outer_size / 2)
             if scale == 0:
                 return
-            rx, ry, rz = right[0], right[1], right[2]
-            ux, uy, uz = up[0], up[1], up[2]
-            SEGMENTS = 32
-            ring_verts = []
-            for i in range(SEGMENTS):
-                angle = 2 * math.pi * i / SEGMENTS
-                cos_a = math.cos(angle)
-                sin_a = math.sin(angle)
-                vx = px + scale * (cos_a * rx + sin_a * ux)
-                vy = py + scale * (cos_a * ry + sin_a * uy)
-                vz = pz + scale * (cos_a * rz + sin_a * uz)
-                ring_verts.append((vx, vy, vz))
+            ring_verts = _build_ring_vertices(
+                px, py, pz, scale,
+                right[0], right[1], right[2],
+                up[0], up[1], up[2],
+            )
             batch = batch_for_shader(shader, 'LINE_LOOP', {"pos": ring_verts})
             shader.bind()
             shader.uniform_float("color", outer_color)
             gpu.state.line_width_set(2.0)
             batch.draw(shader)
-
-        elif style == 'RING_DOT':
-            right, up = get_billboard_basis(context)
-            if right is None or up is None:
-                return
-            scale = get_pixel_scale(context, pos, outer_size / 2)
-            if scale == 0:
-                return
-            rx, ry, rz = right[0], right[1], right[2]
-            ux, uy, uz = up[0], up[1], up[2]
-            SEGMENTS = 32
-            ring_verts = []
-            for i in range(SEGMENTS):
-                angle = 2 * math.pi * i / SEGMENTS
-                cos_a = math.cos(angle)
-                sin_a = math.sin(angle)
-                vx = px + scale * (cos_a * rx + sin_a * ux)
-                vy = py + scale * (cos_a * ry + sin_a * uy)
-                vz = pz + scale * (cos_a * rz + sin_a * uz)
-                ring_verts.append((vx, vy, vz))
-            batch = batch_for_shader(shader, 'LINE_LOOP', {"pos": ring_verts})
-            shader.bind()
-            shader.uniform_float("color", outer_color)
-            gpu.state.line_width_set(2.0)
-            batch.draw(shader)
-            # Center dot (1/3 of outer size)
-            draw_billboard_circle(context, pos, outer_size / 6, inner_color, shader)
+            if style == 'RING_DOT':
+                draw_billboard_circle(context, pos, outer_size / 6, inner_color, shader)
 
     except Exception as e:
         print(f"Error in draw_origin_indicator: {e}")
@@ -802,7 +776,7 @@ def draw_motion_path_overlay():
                         abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
                         # Convert to pure tuple for GPU safety
                         world_points.append((px, py, pz))
-                except:
+                except Exception:
                     continue
             
             shader = gpu.shader.from_builtin('UNIFORM_COLOR')
@@ -830,11 +804,10 @@ def draw_motion_path_overlay():
             if active_bone and active_bone not in bones_to_draw:
                 bones_to_draw.append(active_bone)
             for bone in bones_to_draw:
-                # For each bone, the parent matrix is the Armature's matrix
                 bone_parent_matrix = get_current_parent_matrix(context, obj, bone)
-                draw_enhanced_bone_path(context, obj, bone, bone_parent_matrix, collector)
+                draw_enhanced_path(context, obj, bone_parent_matrix, collector, bone=bone)
         else:
-            draw_enhanced_object_path(context, obj, parent_matrix, collector)
+            draw_enhanced_path(context, obj, parent_matrix, collector)
             
         # Submit Batches
         collector.draw(context)
@@ -848,68 +821,40 @@ def draw_motion_path_overlay():
         import traceback
         traceback.print_exc()
 
-def draw_enhanced_object_path(context, obj, parent_matrix, collector):
-    """Drawing advanced motion paths for object"""
+def draw_enhanced_path(context, obj, parent_matrix, collector, bone=None):
+    """Draw advanced motion path keyframe points and handles for an object or a pose bone."""
     global _state
-    if None not in _state.position_cache:
+    cache_key = bone.name if bone else None
+    if cache_key not in _state.position_cache:
         return
+    bone_name = bone.name if bone else None
     action = obj.animation_data.action if obj.animation_data else None
-    
-    for frame_num, cache_data in _state.position_cache[None].items():
-        local_point = cache_data['position']
-        # Transform to World Space
-        point_3d = parent_matrix @ local_point
-        
-        is_keyframe_point = True
-        is_selected_keyframe = False
-        keyframes_for_location = {}
-        if action:
-            for fcurve in get_fcurves(action):
-                if is_location_fcurve(fcurve):
-                    for keyframe in fcurve.keyframe_points:
-                        if abs(keyframe.co[0] - frame_num) < 0.5:
-                            keyframes_for_location[fcurve.array_index] = keyframe
-                            if keyframe.select_control_point:
-                                is_selected_keyframe = True
-                            break
-        draw_motion_path_point(
-            context, point_3d, frame_num,
-            is_keyframe_point, is_selected_keyframe,
-            keyframes_for_location, action,
-            None, # shader not needed
-            bone=None, parent_matrix=parent_matrix,
-            collector=collector
-        )
 
-def draw_enhanced_bone_path(context, obj, bone, parent_matrix, collector):
-    """Drawing advanced motion paths for armature"""
-    global _state
-    if bone.name not in _state.position_cache:
-        return
-    action = obj.animation_data.action if obj.animation_data else None
-    
-    for frame_num, cache_data in _state.position_cache[bone.name].items():
+    # Pre-build frame→keyframe lookup to avoid O(frames × fcurves) scanning in the draw loop.
+    # frame_keyframe_map: {frame_int: {array_index: BezierKeyframePoint}}
+    frame_keyframe_map = {}
+    frame_selected = set()
+    if action:
+        for fcurve in get_fcurves(action):
+            if is_location_fcurve(fcurve, bone_name):
+                for keyframe in fcurve.keyframe_points:
+                    f = int(keyframe.co[0])
+                    if f not in frame_keyframe_map:
+                        frame_keyframe_map[f] = {}
+                    frame_keyframe_map[f][fcurve.array_index] = keyframe
+                    if keyframe.select_control_point:
+                        frame_selected.add(f)
+
+    for frame_num, cache_data in _state.position_cache[cache_key].items():
         local_point = cache_data['position']
-        # Transform to World Space
         point_3d = parent_matrix @ local_point
-        
-        is_keyframe_point = True
-        is_selected_keyframe = False
-        keyframes_for_location = {}
-        if action:
-            for fcurve in get_fcurves(action):
-                if is_location_fcurve(fcurve, bone.name):
-                    for keyframe in fcurve.keyframe_points:
-                        if abs(keyframe.co[0] - frame_num) < 0.5:
-                            keyframes_for_location[fcurve.array_index] = keyframe
-                            if keyframe.select_control_point:
-                                is_selected_keyframe = True
-                            break
+        keyframes_for_location = frame_keyframe_map.get(frame_num, {})
+        is_selected_keyframe = frame_num in frame_selected
         draw_motion_path_point(
             context, point_3d, frame_num,
-            is_keyframe_point, is_selected_keyframe,
+            True, is_selected_keyframe,
             keyframes_for_location, action,
-            None, # shader not needed
+            None,
             bone=bone, parent_matrix=parent_matrix,
             collector=collector
         )
@@ -1154,6 +1099,8 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
     def invoke(self, context, event):
         wm = context.window_manager
         self._last_keyframe_values = self._get_keyframe_values(context)
+        self._last_active_obj_name = context.active_object.name if context.active_object else None
+        self._last_bone_selection = self._get_bone_selection_state(context)
         self._needs_update = False
         
         # Register Smart Handler
@@ -1172,12 +1119,25 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
     
     def modal(self, context, event):
         wm = context.window_manager
-        
-        # Check bone selection changes (runs in both modes as it's selection based)
+
+        # Detect active object switch (Object mode)
+        active_obj = context.active_object
+        current_obj_name = active_obj.name if active_obj else None
+        if current_obj_name != self._last_active_obj_name:
+            self._last_active_obj_name = current_obj_name
+            # Clear stale selection/drag state from the previous object
+            _state.selected_path_point = None
+            _state.selected_frame = None
+            _state.selected_handle_side = None
+            _state.selected_bone = None
+            _state.selected_handle_point = None
+            _state.selected_handle_data = None
+            _state.is_dragging = False
+            _state.handle_dragging = False
+            self._needs_update = True
+
+        # Check bone selection changes (Pose mode)
         current_bone_selection = self._get_bone_selection_state(context)
-        if not hasattr(self, '_last_bone_selection'):
-            self._last_bone_selection = current_bone_selection
-        
         if current_bone_selection != self._last_bone_selection:
             self._last_bone_selection = current_bone_selection
             self._needs_update = True
@@ -1196,10 +1156,12 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
             except Exception as e:
                 print("Error updating position cache:", e)
             self._needs_update = False
-            if context.area and context.area.type == 'VIEW_3D':
-                context.area.tag_redraw()
+            for window in wm.windows:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
         
-        if not wm.auto_sapty_active:
+        if not wm.auto_update_active:
             self.cancel(context)
             return {'CANCELLED'}
         
@@ -1259,32 +1221,6 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         
         return (active_bone_name, selected_bone_names)
     
-    def _has_selected_keyframes_changed(self, context):
-        """Check the status of selected keyframe"""
-        current_selection_state = self._get_selected_keyframes_state(context)
-        if not hasattr(self, '_last_selection_state'):
-            self._last_selection_state = current_selection_state
-            return False
-        if current_selection_state != self._last_selection_state:
-            self._last_selection_state = current_selection_state
-            return True
-        return False
-    
-    def _get_selected_keyframes_state(self, context):
-        """Select all the keyframes status"""
-        active_object = context.active_object
-        if not active_object or not active_object.animation_data or not active_object.animation_data.action:
-            return None
-        action = active_object.animation_data.action
-        if not action:
-            return None
-        selected_keyframes = []
-        for fcurve in get_fcurves(action):
-            for keyframe in fcurve.keyframe_points:
-                if keyframe.select_control_point:
-                    selected_keyframes.append((fcurve.data_path, fcurve.array_index, keyframe.co[0]))
-        return tuple(sorted(selected_keyframes))
-
 class MOTIONPATH_SetHandleType(bpy.types.Operator):
     """Set handle type for selected keyframes"""
     bl_idname = "motion_path.set_handle_type"
@@ -1316,12 +1252,12 @@ class MOTIONPATH_DirectManipulationToggle(bpy.types.Operator):
         if not wm.direct_manipulation_active:
             wm.direct_manipulation_active = True
             bpy.ops.motion_path.direct_manipulation('INVOKE_DEFAULT')
-            wm.auto_sapty_active = True
+            wm.auto_update_active = True
             bpy.ops.motion_path.auto_update_motion_paths('INVOKE_DEFAULT')
             self.report({'INFO'}, iface_("Enable Direct Path Editing"))
         else:
             wm.direct_manipulation_active = False
-            wm.auto_sapty_active = False
+            wm.auto_update_active = False
             if context.area:
                 context.area.tag_redraw()
             self.report({'INFO'}, iface_("Disable Direct Path Editing"))
@@ -1453,45 +1389,22 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             rv3d = space_data.region_3d
 
             if _state.is_dragging:
-                # Use local_mouse_pos for accurate interaction in the found region
                 mouse_coord = mathutils.Vector(local_mouse_pos)
-                
-                # Calculate total offset from start position
                 new_3d_pos = view3d_utils.region_2d_to_location_3d(region, rv3d, mouse_coord, _state.drag_start_3d)
-                total_offset = new_3d_pos - _state.drag_start_3d
-                
+
                 if _state.selected_handle_side is None:
-                    # For points, we still use incremental update of drag_start_3d for now to avoid breaking existing logic
-                    offset = new_3d_pos - _state.drag_start_3d # This is effectively 0 if we don't update drag_start_3d
-                    # Wait, for points we should probably use total offset too or keep old logic separate
-                    # Let's keep old logic for points: offset relative to last frame
-                    # BUT wait, the previous code updated _state.drag_start_3d at the end.
-                    # To keep point dragging working as before, we need to know the delta.
-                    # Let's revert to using drag_start_3d as the anchor for projection depth, but handle updates differently.
-                    
-                    # For Point Dragging (Legacy Logic):
-                    # We need delta since last frame.
-                    # Since we are NOT updating drag_start_3d for handles, we need to fork logic.
-                    
-                    # Re-implementing logic specifically for points:
-                    pass # Handled in else block
-                    
+                    # Point dragging: incremental delta — anchor updated each frame so depth projection stays correct.
+                    offset = new_3d_pos - _state.drag_start_3d
+                    self.move_selected_points(context, offset)
+                    _state.drag_start_3d = new_3d_pos
                 else:
-                    # Handle dragging uses Total Offset Method
+                    # Handle dragging: total offset from the original drag-start so handles don't drift.
+                    total_offset = new_3d_pos - _state.drag_start_3d
                     self.move_selected_handles(context, total_offset, _state.selected_handle_side)
-                    # NOTE: We DO NOT update _state.drag_start_3d or _state.drag_start_item_pos here anymore
-                
-                if _state.selected_handle_side is None:
-                     # Re-calculate offset for point dragging (incremental)
-                     # We need to update drag_start_3d for point dragging to maintain depth projection and incremental delta
-                     offset = new_3d_pos - _state.drag_start_3d
-                     self.move_selected_points(context, offset)
-                     _state.drag_start_3d = new_3d_pos
-                
-                # Update path line in real-time
+
                 try:
                     build_position_cache(context)
-                except:
+                except Exception:
                     pass
 
                 if context.area and context.area.type == 'VIEW_3D':
@@ -1515,7 +1428,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 # Update path line in real-time
                 try:
                     build_position_cache(context)
-                except:
+                except Exception:
                     pass
 
                 if context.area and context.area.type == 'VIEW_3D':
@@ -1707,7 +1620,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     
                     try:
                         build_position_cache(context)
-                    except:
+                    except Exception:
                         pass
                     
                     if context.area and context.area.type == 'VIEW_3D':
@@ -1721,7 +1634,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     
                     try:
                         build_position_cache(context)
-                    except:
+                    except Exception:
                         pass
                     
                     if context.area and context.area.type == 'VIEW_3D':
@@ -2321,53 +2234,53 @@ def set_handle_type(context, handle_type):
 
 
 
+def _find_and_start_motion_path_operators(context):
+    """Find first available 3D View and start the motion path operators.
+    Returns True if a view was found and operators started, False otherwise.
+    """
+    wm = context.window_manager
+    for window in wm.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+                if region:
+                    with context.temp_override(window=window, area=area, region=region):
+                        if not wm.direct_manipulation_active:
+                            wm.direct_manipulation_active = True
+                            bpy.ops.motion_path.direct_manipulation('INVOKE_DEFAULT')
+                        if not wm.auto_update_active:
+                            wm.auto_update_active = True
+                            bpy.ops.motion_path.auto_update_motion_paths('INVOKE_DEFAULT')
+                    return True
+    return False
+
+
+def _stop_motion_path_operators(context):
+    """Stop motion path operators and clear active flags."""
+    wm = context.window_manager
+    wm.direct_manipulation_active = False
+    wm.auto_update_active = False
+
+
 class MOTIONPATH_ToggleCustomDraw(bpy.types.Operator):
     """Toggle Custom Motion Path Drawing"""
     bl_idname = "motion_path.toggle_custom_draw"
     bl_label = "Toggle Custom Path"
     bl_description = "Enable/Disable Custom Motion Path Drawing"
-    
+
     def execute(self, context):
         wm = context.window_manager
-        
-        # Check current state (flip it)
         new_state = not wm.custom_path_draw_active
         wm.custom_path_draw_active = new_state
-        
+
         if new_state:
-             # Enabling
-             found_view3d = False
-             for window in context.window_manager.windows:
-                 for area in window.screen.areas:
-                     if area.type == 'VIEW_3D':
-                         region = None
-                         for r in area.regions:
-                             if r.type == 'WINDOW':
-                                 region = r
-                                 break
-                         if region:
-                             with context.temp_override(window=window, area=area, region=region):
-                                 if not wm.direct_manipulation_active:
-                                     wm.direct_manipulation_active = True
-                                     bpy.ops.motion_path.direct_manipulation('INVOKE_DEFAULT')
-                                 if not wm.auto_sapty_active:
-                                     wm.auto_sapty_active = True
-                                     bpy.ops.motion_path.auto_update_motion_paths('INVOKE_DEFAULT')
-                             found_view3d = True
-                             break
-                 if found_view3d:
-                     break
-             
-             if not found_view3d:
-                 self.report({'WARNING'}, iface_("Enabled Motion Path, but no 3D View found for interaction."))
+            if not _find_and_start_motion_path_operators(context):
+                self.report({'WARNING'}, iface_("Enabled Motion Path, but no 3D View found for interaction."))
         else:
-            # Disabling
-            wm.direct_manipulation_active = False
-            wm.auto_sapty_active = False
-                
+            _stop_motion_path_operators(context)
+
         if context.area:
             context.area.tag_redraw()
-            
         return {'FINISHED'}
 
 class MotionPathStyleSettings(bpy.types.PropertyGroup):
@@ -2581,44 +2494,15 @@ def ensure_location_keyframes(context, obj):
 def update_custom_path_active(self, context):
     wm = context.window_manager
     if wm.custom_path_draw_active:
-         # Auto-fix missing keyframes
-         try:
-             ensure_location_keyframes(context, context.active_object)
-         except Exception as e:
-             print(f"Motion Path Pro: Error ensuring keyframes: {e}")
-
-         # Enabling
-         found_view3d = False
-         for window in context.window_manager.windows:
-             for area in window.screen.areas:
-                 if area.type == 'VIEW_3D':
-                     region = None
-                     for r in area.regions:
-                         if r.type == 'WINDOW':
-                             region = r
-                             break
-                     if region:
-                         with context.temp_override(window=window, area=area, region=region):
-                             if not wm.direct_manipulation_active:
-                                 wm.direct_manipulation_active = True
-                                 bpy.ops.motion_path.direct_manipulation('INVOKE_DEFAULT')
-                             if not wm.auto_sapty_active:
-                                 wm.auto_sapty_active = True
-                                 bpy.ops.motion_path.auto_update_motion_paths('INVOKE_DEFAULT')
-                         found_view3d = True
-                         break
-             if found_view3d:
-                 pass
-         
-         if not found_view3d:
-             # self.report({'WARNING'}, "Enabled Motion Path, but no 3D View found for interaction.")
-             # Can't report from property update easily
-             print("Motion Path Pro: Enabled, but no 3D View found for interaction.")
+        try:
+            ensure_location_keyframes(context, context.active_object)
+        except Exception as e:
+            print(f"Motion Path Pro: Error ensuring keyframes: {e}")
+        if not _find_and_start_motion_path_operators(context):
+            print("Motion Path Pro: Enabled, but no 3D View found for interaction.")
     else:
-        # Disabling
-        wm.direct_manipulation_active = False
-        wm.auto_sapty_active = False
-            
+        _stop_motion_path_operators(context)
+
     if context.area:
         context.area.tag_redraw()
 
@@ -2674,7 +2558,7 @@ def register():
         description="Enable direct manipulation of points on motion paths",
         default=False
     )
-    bpy.types.WindowManager.auto_sapty_active = bpy.props.BoolProperty(
+    bpy.types.WindowManager.auto_update_active = bpy.props.BoolProperty(
         name="Auto Update Active",
         default=False
     )
@@ -2744,7 +2628,7 @@ def unregister():
     del bpy.types.WindowManager.motion_path_styles
     del bpy.types.WindowManager.custom_path_draw_active
     del bpy.types.WindowManager.direct_manipulation_active
-    del bpy.types.WindowManager.auto_sapty_active
+    del bpy.types.WindowManager.auto_update_active
     del bpy.types.WindowManager.motion_path_fps_limit
     del bpy.types.WindowManager.motion_path_update_mode
     del bpy.types.WindowManager.auto_update_fps
