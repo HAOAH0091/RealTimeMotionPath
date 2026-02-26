@@ -44,7 +44,6 @@ class MotionPathState:
         self.initial_handle_values = {}  # Store initial handle values for drag: {(frame, array_index): value}
         self.draw_handler = None
         self.path_vertices = []
-        self.path_batch = None
         
     def reset(self):
         self.__init__()
@@ -409,18 +408,19 @@ def build_position_cache(context):
 
     COORDINATE SPACE CONTRACT:
       Object mode:
-        Cached positions are in F-Curve local space:
+        Cached positions are raw F-Curve location values (matrix_basis space):
           - Unparented: equals world space.
-          - Parented:   equals parent-relative space (parent transform applied at draw).
+          - Parented:   equals matrix_basis space; converted to world at draw time via
+                        parent.matrix_world @ matrix_parent_inverse.
         get_current_parent_matrix() returns Identity (unparented) or
-        obj.parent.matrix_world (parented).
+        obj.parent.matrix_world @ obj.matrix_parent_inverse (parented).
 
       Pose (bone) mode:
-        Cached positions are in bone matrix_basis space (local bone offset).
+        Cached positions are raw F-Curve location values in bone LOCAL space.
         get_current_parent_matrix() returns:
-          obj.matrix_world @ bone.parent.matrix @ bone.bone.matrix_local  (child bone)
-          obj.matrix_world @ bone.bone.matrix_local                       (root bone)
-        This converts the F-Curve offset to world space correctly without
+          obj.matrix_world @ parent.matrix @ parent.bone.matrix_local.inv() @ bone.matrix_local  (child bone)
+          obj.matrix_world @ bone.bone.matrix_local                                               (root bone)
+        This converts the bone-local F-Curve offset to world space without
         incorporating the bone's own constraint effects.
 
     NOTE on Smart Interaction:
@@ -438,7 +438,6 @@ def build_position_cache(context):
     try:
         _state.position_cache = {}
         _state.path_vertices = []
-        _state.path_batch = None
         
         obj = context.active_object
         
@@ -519,78 +518,95 @@ def build_position_cache(context):
                     path_points = [path_data[f]['position'] for f in frames_range]
             
             _state.path_vertices = path_points
-            if path_points:
-                shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-                _state.path_batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": path_points})
     
     finally:
         _is_updating_cache = False
 
-def get_current_parent_matrix(context, obj, bone=None):
+def get_current_parent_matrix(obj, bone=None):
     """
     Unified calculation of the parent matrix (from cached-position space to world space).
 
     OBJECT mode:
-      Positions are stored in 'parent-local' space (post-constraint world position for
-      unparented objects, or post-constraint position relative to parent for parented
-      objects). The correct transform to world space is therefore:
-        - Unparented  → Identity  (positions ARE world positions)
-        - Parented    → obj.parent.matrix_world  (parent's current world matrix)
-      This avoids baking the object's own constraint effects (rotation, scale) into
-      the parent matrix, which was the root cause of paths appearing to rotate when a
-      rotation-only constraint (e.g. Damped Track) was active.
+      F-Curve location values are in matrix_basis space (the raw location/rotation/scale
+      driven by keyframes). Blender's full world transform is:
+          matrix_world = parent.matrix_world @ matrix_parent_inverse @ matrix_basis
+      So the correct parent matrix to apply to F-Curve values is:
+        - Unparented  → Identity  (F-Curve values ARE world positions)
+        - Parented    → obj.parent.matrix_world @ obj.matrix_parent_inverse
+      matrix_parent_inverse is stored at parenting time (it's the inverse of the parent's
+      world matrix at that moment) and ensures the child does not jump. Without it the
+      path appears at the parent's origin instead of the child's actual position.
+      This formula still avoids baking the object's own constraint effects (rotation,
+      scale) into the parent matrix, preventing paths from rotating when a rotation-only
+      constraint (e.g. Damped Track) is active.
 
     POSE (bone) mode:
-      Bone positions are stored in bone matrix_basis space (local translation offset
-      driven by F-Curves). The parent matrix converts this to world space via:
-          obj.matrix_world @ bone.parent.matrix @ bone.bone.matrix_local  (child bone)
-          obj.matrix_world @ bone.bone.matrix_local                       (root bone)
-      bone.bone.matrix_local is the REST-pose local matrix — unaffected by constraints.
-      bone.parent.matrix is the parent's current POSE matrix — correctly reflects the
-      animated parent chain while excluding this bone's own constraint effects.
-      This mirrors the Object-mode fix: constraint effects on THIS bone cannot rotate
-      or distort the displayed path.
-      Also used for drag operations: parent_matrix.to_3x3().inverted() converts a
-      world-space mouse offset to the F-Curve local space, giving correct drag direction
-      even for bones with rotation constraints.
+      Bone F-Curve location values are offsets in BONE LOCAL space. Converting to world:
+
+        Root bone:
+          armature_world @ bone.matrix_local @ [fx, fy, fz]
+          bone.matrix_local (armature space) converts bone-local offset to armature space.
+
+        Child bone:
+          armature_world @ parent.matrix @ parent.bone.matrix_local.inverted() @ bone.matrix_local @ [fx, fy, fz]
+
+          Step-by-step geometry:
+            bone.matrix_local              — child rest in armature space
+            parent.bone.matrix_local.inv() — "undo" parent rest, giving child rest in
+                                             parent-bone LOCAL space
+            parent.matrix                 — apply parent's CURRENT pose (armature space)
+          When parent has no animation: parent.matrix == parent.bone.matrix_local, so the
+          middle two terms cancel to Identity and the formula reduces to the root-bone case.
+
+      bone.matrix_local is the REST-pose matrix — unaffected by this bone's constraints.
+      parent.matrix is the parent's CURRENT pose — correctly reflects animated parents
+      while excluding this bone's own constraint effects.
+      Also used for drag: parent_matrix.to_3x3().inverted() converts a world-space mouse
+      offset to bone-local F-Curve space for correct drag direction under constraints.
     """
     if obj.mode == 'POSE' and bone:
-        # Bone Logic: derive parent matrix from the parent chain, NOT from this bone's
-        # own final matrix.  Using bone.matrix (post-constraint) here produces the same
-        # "spurious rotation residual" as the old object-mode formula did — the bone's
-        # own rotation constraint (Damped Track, Look At, etc.) would contaminate the
-        # parent matrix and make the displayed path appear rotated.
+        # Bone Logic: use the parent chain to derive the space, NOT this bone's own
+        # post-constraint matrix (bone.matrix).  Using bone.matrix would bake this bone's
+        # rotation/scale constraints into the path, making it appear rotated/distorted.
         #
-        # Correct formula:
-        #   parent_matrix = armature_world × parent_bone_pose × this_bone_rest_local
+        # Correct formula for child bone:
+        #   armature_world × parent_pose × parent_rest_inv × child_rest
         #
-        # bone.bone.matrix_local  = bone's 4x4 REST-pose matrix in armature local space
-        #                           (independent of constraints, stable across frames).
-        # bone.parent.matrix      = parent bone's POSE matrix in armature space
-        #                           (includes parent's own constraints — correct, because
-        #                           the parent's animated state defines the child's space).
+        # bone.parent.matrix                   — parent's CURRENT pose in armature space
+        # bone.parent.bone.matrix_local.inv()  — converts armature space → parent-bone local
+        # bone.bone.matrix_local               — converts parent-bone local → armature space
+        #                                        (child rest position)
+        # Together the middle two terms are parent_rest_inv × child_rest, which is the
+        # child's rest matrix expressed in parent-bone local space.  When the parent has
+        # no animation (parent.matrix == parent.bone.matrix_local) they cancel to Identity.
         if bone.parent:
-            return obj.matrix_world @ bone.parent.matrix @ bone.bone.matrix_local
+            # parent_to_child_rest: child's rest matrix expressed in parent-bone local space.
+            parent_to_child_rest = bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
+            return obj.matrix_world @ bone.parent.matrix @ parent_to_child_rest
         else:
             # Root bone: armature world matrix × bone's rest matrix in armature space.
             return obj.matrix_world @ bone.bone.matrix_local
     else:
-        # Object Logic: derive from parent hierarchy directly.
-        # Do NOT use matrix_world @ matrix_basis.inverted() here — that formula breaks
-        # whenever a constraint (e.g. Damped Track) changes the object's rotation or
-        # scale, because matrix_world then contains constraint effects that are absent
-        # from matrix_basis, leaving a spurious rotation residual in the result.
+        # Object Logic: parent.matrix_world @ matrix_parent_inverse converts F-Curve
+        # values (matrix_basis space) to world space without baking the object's own
+        # constraint effects.  Do NOT use matrix_world @ matrix_basis.inverted() —
+        # that formula breaks when a constraint changes rotation/scale, because
+        # matrix_world contains effects absent from matrix_basis.
         if obj.parent is None:
-            # Unparented: F-Curve values / world positions are already in world space.
+            # Unparented: F-Curve values are already in world space.
             return mathutils.Matrix.Identity(4)
         else:
             parent_mat = obj.parent.matrix_world.copy()
-            # If parented to a specific bone, include that bone's transform.
+            # If parented to a specific bone, include that bone's current pose.
             if obj.parent_type == 'BONE' and obj.parent_bone:
                 if obj.parent.pose and obj.parent_bone in obj.parent.pose.bones:
                     pb = obj.parent.pose.bones[obj.parent_bone]
                     parent_mat = obj.parent.matrix_world @ pb.matrix
-            return parent_mat
+                # Fallback: bone not found in pose (e.g. armature has no action);
+                # treat as plain object parent — matrix_parent_inverse still applied below.
+            # matrix_parent_inverse compensates for the parent's position at the time
+            # of parenting, making F-Curve values map to the correct world positions.
+            return parent_mat @ obj.matrix_parent_inverse
 
 class DrawCollector:
     def __init__(self):
@@ -751,7 +767,7 @@ def draw_motion_path_overlay():
              if not target_bone and context.selected_pose_bones:
                  target_bone = context.selected_pose_bones[0]
         
-        parent_matrix = get_current_parent_matrix(context, obj, target_bone)
+        parent_matrix = get_current_parent_matrix(obj, target_bone)
 
         # Enable Alpha Blending for smoother edges
         gpu.state.blend_set('ALPHA')
@@ -804,7 +820,7 @@ def draw_motion_path_overlay():
             if active_bone and active_bone not in bones_to_draw:
                 bones_to_draw.append(active_bone)
             for bone in bones_to_draw:
-                bone_parent_matrix = get_current_parent_matrix(context, obj, bone)
+                bone_parent_matrix = get_current_parent_matrix(obj, bone)
                 draw_enhanced_path(context, obj, bone_parent_matrix, collector, bone=bone)
         else:
             draw_enhanced_path(context, obj, parent_matrix, collector)
@@ -1697,7 +1713,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         bone_name = bone.name if bone else None
         
         # Calculate parent matrix inverse to transform World Offset -> Local Offset (Parent Space)
-        parent_matrix = get_current_parent_matrix(context, obj, bone)
+        parent_matrix = get_current_parent_matrix(obj, bone)
         # We only care about rotation/scale for the offset vector
         parent_rot_inv = parent_matrix.to_3x3().inverted()
         
@@ -1751,7 +1767,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         bone_name = bone.name if bone else None
         
         # Use helper to get current parent matrix
-        parent_matrix = get_current_parent_matrix(context, obj, bone)
+        parent_matrix = get_current_parent_matrix(obj, bone)
         rotation_matrix = parent_matrix.to_3x3()
         
         # Convert total offset to local space
@@ -1893,7 +1909,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         global_scale = context.window_manager.global_handle_visual_scale
         
         # Use helper
-        parent_matrix = get_current_parent_matrix(context, obj, bone)
+        parent_matrix = get_current_parent_matrix(obj, bone)
         rotation_matrix = parent_matrix.to_3x3()
         
         # Convert total offset to local space
@@ -2081,7 +2097,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 if bone_name not in _state.position_cache:
                     continue
                 
-                parent_matrix = get_current_parent_matrix(context, obj, bone)
+                parent_matrix = get_current_parent_matrix(obj, bone)
                 
                 for frame_num, cache_data in _state.position_cache[bone_name].items():
                     # Transform cached local position to world
@@ -2099,7 +2115,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             if None not in _state.position_cache:
                 return None, None, None, None, None
             
-            parent_matrix = get_current_parent_matrix(context, obj)
+            parent_matrix = get_current_parent_matrix(obj)
             
             for frame_num, cache_data in _state.position_cache[None].items():
                 # Transform cached local position to world
@@ -2135,7 +2151,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 if bone.name not in _state.position_cache:
                     continue
                 
-                parent_matrix = get_current_parent_matrix(context, obj, bone)
+                parent_matrix = get_current_parent_matrix(obj, bone)
                 
                 for frame_num, cache_data in _state.position_cache[bone.name].items():
                     local_pos = cache_data['position']
@@ -2150,7 +2166,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 if active_bone.name not in _state.position_cache:
                     return None, None, None
                 
-                parent_matrix = get_current_parent_matrix(context, obj, active_bone)
+                parent_matrix = get_current_parent_matrix(obj, active_bone)
                 
                 for frame_num, cache_data in _state.position_cache[active_bone.name].items():
                     local_pos = cache_data['position']
@@ -2165,7 +2181,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             if None not in _state.position_cache:
                 return None, None, None
             
-            parent_matrix = get_current_parent_matrix(context, obj)
+            parent_matrix = get_current_parent_matrix(obj)
             
             for frame_num, cache_data in _state.position_cache[None].items():
                 local_pos = cache_data['position']
