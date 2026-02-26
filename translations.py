@@ -56,6 +56,9 @@ translations_dict = {
         ("*", "Handle Endpoint Color"): "手柄端点颜色",
         ("*", "Selected Handle Endpoint Color"): "选中手柄端点颜色",
 
+        # Origin Indicator
+        ("*", "Origin Indicator"): "原点指示器",
+
         # --- WindowManager Properties ---
         ("*", "Enable Motion Path"): "启用运动路径",
         ("*", "Enable custom motion path drawing"): "启用自定义运动路径绘制",

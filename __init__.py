@@ -131,11 +131,53 @@ def get_pixel_scale(context, pos, pixel_size):
         
     return scale
 
-def draw_billboard_circle(context, pos, radius_in_pixels, color, shader):
-    # Validate position and unpack to floats for safety
+_circle_aa_shader = None
+CIRCLE_AA_FEATHER = 0.1  # soft-edge width for anti-aliased circle shader
+DEBUG_CIRCLE_DRAW = False  # set True to print exceptions in circle draw
+
+
+def _get_circle_aa_shader():
+    """Create or return cached anti-aliased circle shader (quad + smoothstep soft edge)."""
+    global _circle_aa_shader
+    if _circle_aa_shader is None:
+        vert_out = gpu.types.GPUStageInterfaceInfo("circle_aa_interface")
+        vert_out.smooth('VEC2', "uvInterp")
+        shader_info = gpu.types.GPUShaderCreateInfo()
+        shader_info.push_constant('MAT4', "ModelViewProjectionMatrix")
+        shader_info.push_constant('VEC4', "color")
+        shader_info.push_constant('FLOAT', "feather")
+        shader_info.vertex_in(0, 'VEC3', "pos")
+        shader_info.vertex_in(1, 'VEC2', "uv")
+        shader_info.vertex_out(vert_out)
+        shader_info.fragment_out(0, 'VEC4', "FragColor")
+        shader_info.vertex_source(
+            "void main()"
+            "{"
+            "  uvInterp = uv;"
+            "  gl_Position = ModelViewProjectionMatrix * vec4(pos, 1.0);"
+            "}"
+        )
+        shader_info.fragment_source(
+            "void main()"
+            "{"
+            "  vec2 uv_centered = uvInterp * 2.0 - 1.0;"
+            "  float dist = length(uv_centered);"
+            "  float alpha = 1.0 - smoothstep(1.0 - feather, 1.0 + feather, dist);"
+            "  FragColor = color * alpha;"
+            "}"
+        )
+        _circle_aa_shader = gpu.shader.create_from_info(shader_info)
+        del vert_out
+        del shader_info
+    return _circle_aa_shader
+
+def draw_billboard_circle(context, pos, radius_in_pixels, color, shader=None):
+    """Draw a circle using quad + custom shader for anti-aliased soft edge.
+    Note: shader arg is ignored (kept for API compatibility).
+    """
     try:
         px, py, pz = pos[0], pos[1], pos[2]
-        if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and 
+        if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
                 abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
             return
     except Exception:
@@ -145,7 +187,6 @@ def draw_billboard_circle(context, pos, radius_in_pixels, color, shader):
     if right is None or up is None:
         return
 
-    # Unpack basis vectors to floats to avoid Vector operations in loop
     try:
         rx, ry, rz = right[0], right[1], right[2]
         ux, uy, uz = up[0], up[1], up[2]
@@ -155,32 +196,43 @@ def draw_billboard_circle(context, pos, radius_in_pixels, color, shader):
     scale = get_pixel_scale(context, pos, radius_in_pixels)
     if scale == 0:
         return
-    segments = 16
-    # Use list of tuples instead of Vectors
-    vertices = [(px, py, pz)]
-    
-    try:
-        for i in range(segments + 1):
-            angle = 2 * math.pi * i / segments
-            cos_a = math.cos(angle)
-            sin_a = math.sin(angle)
-            
-            # Pure float calculation, no mathutils.Vector needed in loop
-            vx = px + scale * (cos_a * rx + sin_a * ux)
-            vy = py + scale * (cos_a * ry + sin_a * uy)
-            vz = pz + scale * (cos_a * rz + sin_a * uz)
-            
-            if not (math.isfinite(vx) and math.isfinite(vy) and math.isfinite(vz) and 
-                    abs(vx) < SAFE_LIMIT and abs(vy) < SAFE_LIMIT and abs(vz) < SAFE_LIMIT):
-                return
-            vertices.append((vx, vy, vz))
-    except Exception:
-        return
 
-    batch = batch_for_shader(shader, 'TRI_FAN', {"pos": vertices})
-    shader.bind()
-    shader.uniform_float("color", color)
-    batch.draw(shader)
+    # Quad corners: center ± right*scale ± up*scale, UV (0,0)-(1,1)
+    c1 = (px - scale * rx - scale * ux, py - scale * ry - scale * uy, pz - scale * rz - scale * uz)
+    c2 = (px + scale * rx - scale * ux, py + scale * ry - scale * uy, pz + scale * rz - scale * uz)
+    c3 = (px + scale * rx + scale * ux, py + scale * ry + scale * uy, pz + scale * rz + scale * uz)
+    c4 = (px - scale * rx + scale * ux, py - scale * ry + scale * uy, pz - scale * rz + scale * uz)
+    for v in (c1, c2, c3, c4):
+        if not (math.isfinite(v[0]) and math.isfinite(v[1]) and math.isfinite(v[2]) and
+                abs(v[0]) < SAFE_LIMIT and abs(v[1]) < SAFE_LIMIT and abs(v[2]) < SAFE_LIMIT):
+            return
+
+    verts = (c1, c2, c3, c4)
+    uvs = ((0, 0), (1, 0), (1, 1), (0, 1))
+    indices = ((0, 1, 2), (0, 2, 3))
+    try:
+        if len(color) >= 4:
+            color_tuple = (float(color[0]), float(color[1]), float(color[2]), float(color[3]))
+        elif len(color) == 3:
+            color_tuple = (float(color[0]), float(color[1]), float(color[2]), 1.0)
+        else:
+            color_tuple = (1.0, 1.0, 1.0, 1.0)
+    except Exception:
+        color_tuple = (1.0, 1.0, 1.0, 1.0)
+
+    shader_aa = _get_circle_aa_shader()
+    batch = batch_for_shader(shader_aa, 'TRIS', {"pos": verts, "uv": uvs}, indices=indices)
+    shader_aa.bind()
+    try:
+        matrix = context.region_data.perspective_matrix
+    except Exception as e:
+        if DEBUG_CIRCLE_DRAW:
+            print(f"[MotionPathPro] Circle draw skipped: {e}")
+        return
+    shader_aa.uniform_float("ModelViewProjectionMatrix", matrix)
+    shader_aa.uniform_float("color", color_tuple)
+    shader_aa.uniform_float("feather", CIRCLE_AA_FEATHER)
+    batch.draw(shader_aa)
 
 def draw_billboard_square(context, pos, half_size_in_pixels, color, shader):
     try:
@@ -237,8 +289,11 @@ def draw_billboard_square(context, pos, half_size_in_pixels, color, shader):
     shader.uniform_float("color", color)
     batch.draw(shader)
 
-def draw_batched_billboard_circles(context, points, radius_in_pixels, color, shader, segments=8):
-    if not points or radius_in_pixels <= 0 or segments <= 0 or not shader:
+def draw_batched_billboard_circles(context, points, radius_in_pixels, color, shader=None, segments=8):
+    """Draw circles using quad + custom shader for anti-aliased soft edge.
+    Note: shader and segments args are ignored (kept for API compatibility).
+    """
+    if not points or radius_in_pixels <= 0:
         return
     
     right, up = get_billboard_basis(context)
@@ -251,100 +306,73 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
     except Exception:
         return
     
-    # Precompute unit circle (pure floats)
-    unit_verts = []
-    for i in range(segments):
-        angle = 2 * math.pi * i / segments
-        unit_verts.append((math.cos(angle), math.sin(angle)))
-    
-    # Batch processing - Reduced batch size to prevent driver crashes
-    BATCH_SIZE = 500
-    total_points = len(points)
-    
-    # Convert color to tuple if it's a Vector, for safety with GPU shader
     try:
         if hasattr(color, 'to_tuple'):
             safe_color = color.to_tuple()
         else:
             safe_color = tuple(float(c) for c in color)
-            
-        # Ensure color is RGBA
         if len(safe_color) == 3:
             safe_color = (safe_color[0], safe_color[1], safe_color[2], 1.0)
         elif len(safe_color) != 4:
-            safe_color = (1.0, 1.0, 1.0, 1.0) # Fallback
+            safe_color = (1.0, 1.0, 1.0, 1.0)
     except Exception:
         safe_color = (1.0, 1.0, 1.0, 1.0)
 
-    for i in range(0, total_points, BATCH_SIZE):
-        try:
-            batch_points = points[i : min(i + BATCH_SIZE, total_points)]
-            
-            all_vertices = []
-            all_indices = []
-            start_idx = 0
-            
-            for pos in batch_points:
-                # Validate and unpack pos
-                try:
-                    px, py, pz = pos[0], pos[1], pos[2]
-                except Exception:
-                    continue
+    uv_quad = ((0, 0), (1, 0), (1, 1), (0, 1))
+    BATCH_SIZE = 500
+    try:
+        matrix = context.region_data.perspective_matrix
+    except Exception as e:
+        if DEBUG_CIRCLE_DRAW:
+            print(f"[MotionPathPro] Batched circles skipped: {e}")
+        return
+    shader_aa = _get_circle_aa_shader()
 
-                if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and 
-                        abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
-                    continue
-
-                scale = get_pixel_scale(context, pos, radius_in_pixels)
-                if scale == 0: continue
-                
-                # Center
-                center_vert = (px, py, pz)
-                
-                # Rim
-                rim_verts = []
-                valid_circle = True
-                for x, y in unit_verts: # x, y are cos, sin
-                    vx = px + scale * (x * rx + y * ux)
-                    vy = py + scale * (x * ry + y * uy)
-                    vz = pz + scale * (x * rz + y * uz)
-                    
-                    if not (math.isfinite(vx) and math.isfinite(vy) and math.isfinite(vz) and 
-                            abs(vx) < SAFE_LIMIT and abs(vy) < SAFE_LIMIT and abs(vz) < SAFE_LIMIT):
-                        valid_circle = False
-                        break
-                    rim_verts.append((vx, vy, vz))
-                    
-                if not valid_circle:
-                    continue
-
-                # Append vertices
-                all_vertices.append(center_vert)
-                all_vertices.extend(rim_verts)
-                    
-                # Indices
-                # Center is at start_idx
-                # Rim starts at start_idx + 1
-                for k in range(segments):
-                    v1 = start_idx + 1 + k
-                    v2 = start_idx + 1 + ((k + 1) % segments)
-                    all_indices.append((start_idx, v1, v2))
-                    
-                start_idx += (segments + 1)
-            
-            if not all_vertices or not all_indices:
+    for i in range(0, len(points), BATCH_SIZE):
+        batch_points = points[i : min(i + BATCH_SIZE, len(points))]
+        all_verts = []
+        all_uvs = []
+        all_indices = []
+        base = 0
+        for pos in batch_points:
+            try:
+                px, py, pz = pos[0], pos[1], pos[2]
+            except Exception:
                 continue
-                
-            batch = batch_for_shader(shader, 'TRIS', {"pos": all_vertices}, indices=all_indices)
-            shader.bind()
-            shader.uniform_float("color", safe_color)
-            batch.draw(shader)
-            
-            # Explicitly cleanup batch to prevent driver resource exhaustion
-            del batch
-        except Exception as e:
-            print(f"Error drawing batch: {e}")
+            if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
+                    abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
+                continue
+            scale = get_pixel_scale(context, pos, radius_in_pixels)
+            if scale == 0:
+                continue
+            c1 = (px - scale * rx - scale * ux, py - scale * ry - scale * uy, pz - scale * rz - scale * uz)
+            c2 = (px + scale * rx - scale * ux, py + scale * ry - scale * uy, pz + scale * rz - scale * uz)
+            c3 = (px + scale * rx + scale * ux, py + scale * ry + scale * uy, pz + scale * rz + scale * uz)
+            c4 = (px - scale * rx + scale * ux, py - scale * ry + scale * uy, pz - scale * rz + scale * uz)
+            valid = True
+            for v in (c1, c2, c3, c4):
+                if not (math.isfinite(v[0]) and math.isfinite(v[1]) and math.isfinite(v[2]) and
+                        abs(v[0]) < SAFE_LIMIT and abs(v[1]) < SAFE_LIMIT and abs(v[2]) < SAFE_LIMIT):
+                    valid = False
+                    break
+            if not valid:
+                continue
+            all_verts.extend((c1, c2, c3, c4))
+            all_uvs.extend(uv_quad)
+            all_indices.extend(((base, base + 1, base + 2), (base, base + 2, base + 3)))
+            base += 4
+        if not all_verts or not all_indices:
             continue
+        try:
+            batch = batch_for_shader(shader_aa, 'TRIS', {"pos": all_verts, "uv": all_uvs}, indices=all_indices)
+            shader_aa.bind()
+            shader_aa.uniform_float("ModelViewProjectionMatrix", matrix)
+            shader_aa.uniform_float("color", safe_color)
+            shader_aa.uniform_float("feather", CIRCLE_AA_FEATHER)
+            batch.draw(shader_aa)
+        except Exception as e:
+            if DEBUG_CIRCLE_DRAW:
+                print(f"[MotionPathPro] Error drawing circles batch: {e}")
 
 def is_location_fcurve(fcurve, bone_name=None):
     """Check if fcurve is a location fcurve for an object or a specific bone."""
@@ -650,28 +678,24 @@ class DrawCollector:
         self.circles[key].append(pos)
         
     def draw(self, context):
-        # Draw Lines
+        # Draw Lines (POLYLINE_SMOOTH_COLOR for anti-aliasing)
         if self.lines:
             try:
-                shader = gpu.shader.from_builtin('SMOOTH_COLOR')
+                shader = gpu.shader.from_builtin('POLYLINE_SMOOTH_COLOR')
                 batch = batch_for_shader(shader, 'LINES', {"pos": self.lines, "color": self.line_colors})
                 shader.bind()
-                
-                # Explicitly set line width for handles to prevent inheriting path width
+                viewport_size = gpu.state.viewport_get()[2:]
+                shader.uniform_float("viewportSize", viewport_size)
                 wm = context.window_manager
-                if hasattr(wm, 'motion_path_styles'):
-                    gpu.state.line_width_set(wm.motion_path_styles.handle_line_width)
-                else:
-                    gpu.state.line_width_set(2.0)
-                    
+                line_width = wm.motion_path_styles.handle_line_width if hasattr(wm, 'motion_path_styles') else 2.0
+                shader.uniform_float("lineWidth", line_width)
                 batch.draw(shader)
             except Exception as e:
                 print(f"Error drawing lines batch: {e}")
             
-        # Draw Circles
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        # Draw Circles (POLYLINE for anti-aliasing)
         for (radius, color), points in self.circles.items():
-            draw_batched_billboard_circles(context, points, radius, color, shader)
+            draw_batched_billboard_circles(context, points, radius, color, segments=8)
 
 def _build_ring_vertices(px, py, pz, scale, rx, ry, rz, ux, uy, uz, segments=32):
     """Build a list of 3D vertex tuples forming a screen-aligned ring."""
@@ -705,7 +729,6 @@ def draw_origin_indicator(context, obj, bone, styles):
             return
 
         pos = (px, py, pz)
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         style = styles.origin_indicator_style
         outer_size = styles.origin_indicator_size
         outer_color = tuple(styles.origin_indicator_color)
@@ -714,7 +737,7 @@ def draw_origin_indicator(context, obj, bone, styles):
         gpu.state.blend_set('ALPHA')
 
         if style == 'DOT':
-            draw_billboard_circle(context, pos, outer_size / 2, inner_color, shader)
+            draw_billboard_circle(context, pos, outer_size / 2, inner_color)
 
         elif style in {'RING', 'RING_DOT'}:
             right, up = get_billboard_basis(context)
@@ -728,13 +751,15 @@ def draw_origin_indicator(context, obj, bone, styles):
                 right[0], right[1], right[2],
                 up[0], up[1], up[2],
             )
+            shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
             batch = batch_for_shader(shader, 'LINE_LOOP', {"pos": ring_verts})
             shader.bind()
+            shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+            shader.uniform_float("lineWidth", 2.0)
             shader.uniform_float("color", outer_color)
-            gpu.state.line_width_set(2.0)
             batch.draw(shader)
             if style == 'RING_DOT':
-                draw_billboard_circle(context, pos, outer_size / 6, inner_color, shader)
+                draw_billboard_circle(context, pos, outer_size / 6, inner_color)
 
     except Exception as e:
         print(f"Error in draw_origin_indicator: {e}")
@@ -763,9 +788,10 @@ def draw_motion_path_overlay():
         # Enable Alpha Blending for smoother edges
         gpu.state.blend_set('ALPHA')
 
-        # Draw continuous path lines for ALL cached targets
+        # Draw continuous path lines for ALL cached targets (POLYLINE for anti-aliasing)
         if wm.custom_path_draw_active and _state.path_vertices:
-            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+            shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+            viewport_size = gpu.state.viewport_get()[2:]
             
             for (pv_obj_name, pv_bone_name), vertices in _state.path_vertices.items():
                 if not vertices:
@@ -798,12 +824,13 @@ def draw_motion_path_overlay():
                 if len(world_points) >= 2:
                     batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": world_points})
                     shader.bind()
-                    shader.uniform_float("color", styles.path_color) 
-                    gpu.state.line_width_set(styles.path_width)
+                    shader.uniform_float("viewportSize", viewport_size)
+                    shader.uniform_float("lineWidth", styles.path_width)
+                    shader.uniform_float("color", styles.path_color)
                     batch.draw(shader)
                 
                 if styles.show_frame_points and world_points:
-                    draw_batched_billboard_circles(context, world_points, styles.frame_point_size / 2, styles.frame_point_color, shader, segments=8)
+                    draw_batched_billboard_circles(context, world_points, styles.frame_point_size / 2, styles.frame_point_color, segments=8)
         
         _state.handle_points = []
         
@@ -2660,6 +2687,8 @@ def register():
         bpy.types.VIEW3D_HT_header.append(draw_header_button)
 
 def unregister():
+    global _circle_aa_shader
+    _circle_aa_shader = None
     # Remove from headers
     if hasattr(bpy.types, "VIEW3D_HT_header"):
         bpy.types.VIEW3D_HT_header.remove(draw_header_button)
