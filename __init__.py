@@ -1340,7 +1340,7 @@ def find_region_under_mouse(context, event):
     """
     Manually find the 3D View region under the mouse.
     This is required because 'context' in modal operators can be stale when switching workspaces.
-    Returns: (region, space_data, local_mouse_pos) or (None, None, None)
+    Returns: (region, space_data, local_mouse_pos, area) or (None, None, None, None)
     """
     mouse_x = event.mouse_x
     mouse_y = event.mouse_y
@@ -1348,10 +1348,6 @@ def find_region_under_mouse(context, event):
     # Support multi-window setups
     # Blender events are typically relative to the active window
     # We iterate over all windows to be safe
-    
-    target_window = None
-    target_area = None
-    target_region = None
     
     # Try current context window first
     windows_to_check = [context.window] if context.window else []
@@ -1385,9 +1381,9 @@ def find_region_under_mouse(context, event):
                             local_x = mouse_x - region.x
                             local_y = mouse_y - region.y
                             space_data = area.spaces.active
-                            return region, space_data, (local_x, local_y)
+                            return region, space_data, (local_x, local_y), area
 
-    return None, None, None
+    return None, None, None, None
 
 class MOTIONPATH_DirectManipulation(bpy.types.Operator):
     """Directly manipulate points on motion paths"""
@@ -1453,7 +1449,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             self._last_draw_time = current_time
             
             # Use manual region finding to ensure we are interacting with the correct 3D View
-            region, space_data, local_mouse_pos = find_region_under_mouse(context, event)
+            region, space_data, local_mouse_pos, target_area = find_region_under_mouse(context, event)
             if not region or not space_data:
                 # Mouse is not over a 3D View, pass through event
                 return {'PASS_THROUGH'}
@@ -1479,8 +1475,9 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 except Exception:
                     pass
 
-                if context.area and context.area.type == 'VIEW_3D':
-                    context.area.tag_redraw()
+                area_to_redraw = target_area if target_area else context.area
+                if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                    area_to_redraw.tag_redraw()
                     
             elif _state.handle_dragging and _state.selected_handle_point is not None:
                 mouse_coord = mathutils.Vector(local_mouse_pos)
@@ -1503,15 +1500,16 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 except Exception:
                     pass
 
-                if context.area and context.area.type == 'VIEW_3D':
-                    context.area.tag_redraw()
+                area_to_redraw = target_area if target_area else context.area
+                if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                    area_to_redraw.tag_redraw()
                     
             return {'PASS_THROUGH'}
         
         elif event.type == 'RIGHTMOUSE':
             if event.value == 'PRESS':
                 # Use manual region finding
-                region, space_data, local_mouse_pos = find_region_under_mouse(context, event)
+                region, space_data, local_mouse_pos, target_area = find_region_under_mouse(context, event)
                 if not region or not space_data:
                     return {'PASS_THROUGH'}
                 rv3d = space_data.region_3d
@@ -1543,8 +1541,9 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                                         kp.select_control_point = True
                                         break
                     
-                    if context.area:
-                        context.area.tag_redraw()
+                    area_to_redraw = target_area if target_area else context.area
+                    if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                        area_to_redraw.tag_redraw()
                     
                     bpy.ops.wm.call_menu(name="MOTIONPATH_MT_context_menu")
                     return {'RUNNING_MODAL'}
@@ -1553,10 +1552,11 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         elif event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
                 # Use manual region finding
-                region, space_data, local_mouse_pos = find_region_under_mouse(context, event)
+                region, space_data, local_mouse_pos, target_area = find_region_under_mouse(context, event)
                 if not region or not space_data:
                     return {'PASS_THROUGH'}
                 rv3d = space_data.region_3d
+                area_to_redraw = target_area if target_area else context.area
 
                 if not event.shift:
                     _state.selected_handle_point = None
@@ -1596,8 +1596,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                                         kp.select_control_point = True
                                         break
                     
-                    if context.area and context.area.type == 'VIEW_3D':
-                        context.area.tag_redraw()
+                    if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                        area_to_redraw.tag_redraw()
                     return {'RUNNING_MODAL'}
                 
                 hit_side, hit_handle_pos, hit_frame, point_3d, hit_bone = self.get_motion_path_handle_at_mouse(context, event, region, rv3d, local_mouse_pos)
@@ -1629,8 +1629,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                                         break
                     
                     _state.is_dragging = True
-                    if context.area and context.area.type == 'VIEW_3D':
-                        context.area.tag_redraw()
+                    if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                        area_to_redraw.tag_redraw()
                     return {'RUNNING_MODAL'}
                 
                 hit_point, hit_frame, hit_bone = self.get_motion_path_point_at_mouse(context, event, region, rv3d, local_mouse_pos)
@@ -1682,8 +1682,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                                             break
                     
                     _state.is_dragging = True
-                    if context.area and context.area.type == 'VIEW_3D':
-                        context.area.tag_redraw()
+                    if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                        area_to_redraw.tag_redraw()
                     return {'RUNNING_MODAL'}
                     
             elif event.value == 'RELEASE':
@@ -1701,8 +1701,10 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     except Exception:
                         pass
                     
-                    if context.area and context.area.type == 'VIEW_3D':
-                        context.area.tag_redraw()
+                    _, _, _, release_area = find_region_under_mouse(context, event)
+                    area_to_redraw = release_area if release_area else context.area
+                    if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                        area_to_redraw.tag_redraw()
                     return {'RUNNING_MODAL'}
                 elif _state.handle_dragging:
                     bpy.ops.ed.undo_push(message=iface_("Move Motion Path Handle"))
@@ -1716,8 +1718,10 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     except Exception:
                         pass
                     
-                    if context.area and context.area.type == 'VIEW_3D':
-                        context.area.tag_redraw()
+                    _, _, _, release_area = find_region_under_mouse(context, event)
+                    area_to_redraw = release_area if release_area else context.area
+                    if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                        area_to_redraw.tag_redraw()
                     return {'RUNNING_MODAL'}
         
         elif event.type == 'ESC':
