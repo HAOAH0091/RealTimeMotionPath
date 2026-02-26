@@ -35,21 +35,34 @@ class MotionPathState:
         self.selected_path_point = None
         self.selected_frame = None
         self.selected_handle_side = None
-        self.selected_bone = None
+        self.selected_bone_name = None  # bone name string (safe, no direct RNA ref)
         self.handle_points = []
         self.selected_handle_point = None
         self.selected_handle_data = None  # Store handle data directly to avoid index errors
         self.handle_dragging = False
-        self.position_cache = {}
+        self.selected_drag_object_name = None  # object name string (safe, no direct RNA ref)
+        self.position_cache = {}  # {obj_name: {cache_key: {frame: {'position': Vector}}}}
         self.initial_handle_values = {}  # Store initial handle values for drag: {(frame, array_index): value}
         self.draw_handler = None
-        self.path_vertices = []
+        self.path_vertices = {}  # {(obj_name, bone_name_or_None): [Vector, ...]}
         
     def reset(self):
         self.__init__()
 
 
 _state = MotionPathState()
+
+def _get_drag_obj(context):
+    """Safely resolve the drag-target object from its stored name. Never returns a stale RNA ref."""
+    global _state
+    if _state.selected_drag_object_name:
+        try:
+            obj = bpy.data.objects.get(_state.selected_drag_object_name)
+            if obj:
+                return obj
+        except Exception:
+            pass
+    return context.active_object
 
 # Global lock to prevent recursion in smart update
 _is_updating_cache = False
@@ -437,88 +450,72 @@ def build_position_cache(context):
     
     try:
         _state.position_cache = {}
-        _state.path_vertices = []
+        _state.path_vertices = {}
+        
+        if (hasattr(bpy.context.window_manager, 'skip_motion_path_cache') and 
+             bpy.context.window_manager.skip_motion_path_cache):
+            return
         
         obj = context.active_object
-        
-        # Combined early exit checks
-        if (not obj or 
-            not obj.animation_data or 
-            not obj.animation_data.action or
-            (hasattr(bpy.context.window_manager, 'skip_motion_path_cache') and 
-             bpy.context.window_manager.skip_motion_path_cache)):
-            return
-                
         wm = context.window_manager
-        action = obj.animation_data.action
         frame_start = context.scene.frame_start
         frame_end = context.scene.frame_end
+        frames_range = range(frame_start, frame_end + 1)
         
-        # 1. Build Keyframe Cache (Sparse) for Handles and Points
-        if obj.mode == 'POSE':
+        if obj and obj.mode == 'POSE':
+            # --- POSE MODE: single armature, all selected bones ---
+            if not obj.animation_data or not obj.animation_data.action:
+                return
+            action = obj.animation_data.action
+            obj_name = obj.name
+            
             bones_to_cache = set(context.selected_pose_bones or [])
             if context.active_pose_bone:
                 bones_to_cache.add(context.active_pose_bone)
 
-            # FAST PATH for all bones — read F-Curves directly, no frame_set needed.
-            # Bones with constraints (IK, Damped Track, etc.) or drivers are handled
-            # the same way: only the F-Curve-driven location offset is shown.
-            # Bones with no location F-Curves (e.g. pure IK end-effectors) produce an
-            # empty 'frames' set and are skipped — correct behaviour (nothing to display).
             for bone in bones_to_cache:
-                bone_name = bone.name
-                fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc, bone_name)]
-                frames = set(int(kp.co[0]) for fc in fcurves for kp in fc.keyframe_points
-                             if frame_start <= kp.co[0] <= frame_end)
-                if not frames:
+                try:
+                    bone_name = bone.name
+                    fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc, bone_name)]
+                    frames = set(int(kp.co[0]) for fc in fcurves for kp in fc.keyframe_points
+                                 if frame_start <= kp.co[0] <= frame_end)
+                    if not frames:
+                        continue
+                    path_data = calculate_path_from_fcurves(obj, action, frames, bone_name=bone_name)
+                    _state.position_cache.setdefault(obj_name, {})[bone_name] = path_data
+                    
+                    if wm.custom_path_draw_active:
+                        dense_data = calculate_path_from_fcurves(obj, action, frames_range, bone_name=bone_name)
+                        _state.path_vertices[(obj_name, bone_name)] = [dense_data[f]['position'] for f in frames_range]
+                except Exception:
                     continue
-                path_data = calculate_path_from_fcurves(obj, action, frames, bone_name=bone_name)
-                _state.position_cache[bone_name] = path_data
         else:
-            # OBJECT MODE — FAST PATH: read F-Curves directly for all objects.
-            # Constraints / drivers that affect rotation or scale do not change the
-            # F-Curve-driven location values, so this is always correct for position.
-            # The parent matrix fix in get_current_parent_matrix ensures that
-            # rotation-only constraints (Damped Track, etc.) no longer pollute the
-            # displayed path.
-            fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc)]
-            frames = sorted(set(int(kp.co[0]) for fc in fcurves for kp in fc.keyframe_points
-                         if frame_start <= kp.co[0] <= frame_end))
-            path_data = calculate_path_from_fcurves(obj, action, frames)
-            _state.position_cache[None] = path_data
-    
-        # 2. Build Path Line Batch (Dense) - Only if custom draw is active
-        if wm.custom_path_draw_active:
-            path_points = []
-            # Determine which object/bone to trace
-            target_bone = None
-            if obj.mode == 'POSE':
-                 # Use active pose bone for the path line
-                 target_bone = context.active_pose_bone
-                 if not target_bone and context.selected_pose_bones:
-                     target_bone = context.selected_pose_bones[0]
+            # --- OBJECT MODE: all selected objects ---
+            objects_to_cache = list(context.selected_objects or [])
+            if obj and obj not in objects_to_cache:
+                objects_to_cache.append(obj)
             
-            if (obj.mode == 'OBJECT') or (obj.mode == 'POSE' and target_bone):
-                # Optimization: Only calculate path if there are location fcurves
-                should_calculate_path = False
-                
-                if obj.mode == 'POSE' and target_bone:
-                     if any(is_location_fcurve(fc, target_bone.name) for fc in get_fcurves(action)):
-                         should_calculate_path = True
-                else:
-                     if any(is_location_fcurve(fc) for fc in get_fcurves(action)):
-                         should_calculate_path = True
-                
-                if should_calculate_path:
-                    # FAST PATH for path line — always read F-Curves directly.
-                    # No frame_set; no scene state is touched.
-                    target_bone_name = target_bone.name if (obj.mode == 'POSE' and target_bone) else None
-                    frames_range = range(frame_start, frame_end + 1)
-                    path_data = calculate_path_from_fcurves(obj, action, frames_range, bone_name=target_bone_name)
-                    path_points = [path_data[f]['position'] for f in frames_range]
-            
-            _state.path_vertices = path_points
-    
+            for cache_obj in objects_to_cache:
+                try:
+                    if not cache_obj.animation_data or not cache_obj.animation_data.action:
+                        continue
+                    action = cache_obj.animation_data.action
+                    obj_name = cache_obj.name
+                    
+                    fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc)]
+                    frames = sorted(set(int(kp.co[0]) for fc in fcurves for kp in fc.keyframe_points
+                                 if frame_start <= kp.co[0] <= frame_end))
+                    if not frames:
+                        continue
+                    path_data = calculate_path_from_fcurves(cache_obj, action, frames)
+                    _state.position_cache.setdefault(obj_name, {})[None] = path_data
+                    
+                    if wm.custom_path_draw_active:
+                        dense_data = calculate_path_from_fcurves(cache_obj, action, frames_range)
+                        _state.path_vertices[(obj_name, None)] = [dense_data[f]['position'] for f in frames_range]
+                except Exception:
+                    continue
+     
     finally:
         _is_updating_cache = False
 
@@ -564,49 +561,54 @@ def get_current_parent_matrix(obj, bone=None):
       Also used for drag: parent_matrix.to_3x3().inverted() converts a world-space mouse
       offset to bone-local F-Curve space for correct drag direction under constraints.
     """
-    if obj.mode == 'POSE' and bone:
-        # Bone Logic: use the parent chain to derive the space, NOT this bone's own
-        # post-constraint matrix (bone.matrix).  Using bone.matrix would bake this bone's
-        # rotation/scale constraints into the path, making it appear rotated/distorted.
-        #
-        # Correct formula for child bone:
-        #   armature_world × parent_pose × parent_rest_inv × child_rest
-        #
-        # bone.parent.matrix                   — parent's CURRENT pose in armature space
-        # bone.parent.bone.matrix_local.inv()  — converts armature space → parent-bone local
-        # bone.bone.matrix_local               — converts parent-bone local → armature space
-        #                                        (child rest position)
-        # Together the middle two terms are parent_rest_inv × child_rest, which is the
-        # child's rest matrix expressed in parent-bone local space.  When the parent has
-        # no animation (parent.matrix == parent.bone.matrix_local) they cancel to Identity.
-        if bone.parent:
-            # parent_to_child_rest: child's rest matrix expressed in parent-bone local space.
-            parent_to_child_rest = bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
-            return obj.matrix_world @ bone.parent.matrix @ parent_to_child_rest
+    try:
+        if obj.mode == 'POSE' and bone:
+            # Bone Logic: use the parent chain to derive the space, NOT this bone's own
+            # post-constraint matrix (bone.matrix).  Using bone.matrix would bake this bone's
+            # rotation/scale constraints into the path, making it appear rotated/distorted.
+            #
+            # Correct formula for child bone:
+            #   armature_world × parent_pose × parent_rest_inv × child_rest
+            #
+            # bone.parent.matrix                   — parent's CURRENT pose in armature space
+            # bone.parent.bone.matrix_local.inv()  — converts armature space → parent-bone local
+            # bone.bone.matrix_local               — converts parent-bone local → armature space
+            #                                        (child rest position)
+            # Together the middle two terms are parent_rest_inv × child_rest, which is the
+            # child's rest matrix expressed in parent-bone local space.  When the parent has
+            # no animation (parent.matrix == parent.bone.matrix_local) they cancel to Identity.
+            if bone.parent:
+                # parent_to_child_rest: child's rest matrix expressed in parent-bone local space.
+                parent_to_child_rest = bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
+                return obj.matrix_world @ bone.parent.matrix @ parent_to_child_rest
+            else:
+                # Root bone: armature world matrix × bone's rest matrix in armature space.
+                return obj.matrix_world @ bone.bone.matrix_local
         else:
-            # Root bone: armature world matrix × bone's rest matrix in armature space.
-            return obj.matrix_world @ bone.bone.matrix_local
-    else:
-        # Object Logic: parent.matrix_world @ matrix_parent_inverse converts F-Curve
-        # values (matrix_basis space) to world space without baking the object's own
-        # constraint effects.  Do NOT use matrix_world @ matrix_basis.inverted() —
-        # that formula breaks when a constraint changes rotation/scale, because
-        # matrix_world contains effects absent from matrix_basis.
-        if obj.parent is None:
-            # Unparented: F-Curve values are already in world space.
-            return mathutils.Matrix.Identity(4)
-        else:
-            parent_mat = obj.parent.matrix_world.copy()
-            # If parented to a specific bone, include that bone's current pose.
-            if obj.parent_type == 'BONE' and obj.parent_bone:
-                if obj.parent.pose and obj.parent_bone in obj.parent.pose.bones:
-                    pb = obj.parent.pose.bones[obj.parent_bone]
-                    parent_mat = obj.parent.matrix_world @ pb.matrix
-                # Fallback: bone not found in pose (e.g. armature has no action);
-                # treat as plain object parent — matrix_parent_inverse still applied below.
-            # matrix_parent_inverse compensates for the parent's position at the time
-            # of parenting, making F-Curve values map to the correct world positions.
-            return parent_mat @ obj.matrix_parent_inverse
+            # Object Logic: parent.matrix_world @ matrix_parent_inverse converts F-Curve
+            # values (matrix_basis space) to world space without baking the object's own
+            # constraint effects.  Do NOT use matrix_world @ matrix_basis.inverted() —
+            # that formula breaks when a constraint changes rotation/scale, because
+            # matrix_world contains effects absent from matrix_basis.
+            if obj.parent is None:
+                # Unparented: F-Curve values are already in world space.
+                return mathutils.Matrix.Identity(4)
+            else:
+                parent_mat = obj.parent.matrix_world.copy()
+                # If parented to a specific bone, include that bone's current pose.
+                if obj.parent_type == 'BONE' and obj.parent_bone:
+                    if obj.parent.pose and obj.parent_bone in obj.parent.pose.bones:
+                        pb = obj.parent.pose.bones[obj.parent_bone]
+                        parent_mat = obj.parent.matrix_world @ pb.matrix
+                    # Fallback: bone not found in pose (e.g. armature has no action);
+                    # treat as plain object parent — matrix_parent_inverse still applied below.
+                # matrix_parent_inverse compensates for the parent's position at the time
+                # of parenting, making F-Curve values map to the correct world positions.
+                return parent_mat @ obj.matrix_parent_inverse
+    except Exception:
+        # Catches Python-level RNA access errors (e.g. ReferenceError). Does NOT catch
+        # C++ EXCEPTION_ACCESS_VIOLATION; the primary fix is avoiding stale RNA refs in _state.
+        return mathutils.Matrix.Identity(4)
 
 class DrawCollector:
     def __init__(self):
@@ -755,81 +757,94 @@ def draw_motion_path_overlay():
         
         global _state
         obj = context.active_object
-        if not obj:
-            return
 
         styles = wm.motion_path_styles
-        
-        # Get current parent matrix for real-time update
-        target_bone = None
-        if obj.mode == 'POSE':
-             target_bone = context.active_pose_bone
-             if not target_bone and context.selected_pose_bones:
-                 target_bone = context.selected_pose_bones[0]
-        
-        parent_matrix = get_current_parent_matrix(obj, target_bone)
 
         # Enable Alpha Blending for smoother edges
         gpu.state.blend_set('ALPHA')
 
-        # Draw the continuous path line first
+        # Draw continuous path lines for ALL cached targets
         if wm.custom_path_draw_active and _state.path_vertices:
-            # Transform local vertices to world and validate explicitly
-            # Replaces list comprehension to avoid Python 3.11/Vulkan crash (PyTuple_GetItem)
-            world_points = []
-            for v in _state.path_vertices:
-                try:
-                    # Transform
-                    p = parent_matrix @ v
-                    
-                    # Explicit validation without using all() generator or implicit iteration
-                    # Access components by index directly
-                    px = p[0]
-                    py = p[1]
-                    pz = p[2]
-                    
-                    if (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
-                        abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
-                        # Convert to pure tuple for GPU safety
-                        world_points.append((px, py, pz))
-                except Exception:
-                    continue
-            
             shader = gpu.shader.from_builtin('UNIFORM_COLOR')
             
-            if len(world_points) >= 2:
-                batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": world_points})
+            for (pv_obj_name, pv_bone_name), vertices in _state.path_vertices.items():
+                if not vertices:
+                    continue
+                draw_obj = bpy.data.objects.get(pv_obj_name)
+                if not draw_obj:
+                    continue
                 
-                shader.bind()
-                shader.uniform_float("color", styles.path_color) 
-                gpu.state.line_width_set(styles.path_width)
-                batch.draw(shader)
-            
-            # Draw Frame Points
-            if styles.show_frame_points and world_points:
-                draw_batched_billboard_circles(context, world_points, styles.frame_point_size / 2, styles.frame_point_color, shader, segments=8)
+                draw_bone = None
+                if pv_bone_name and draw_obj.mode == 'POSE' and draw_obj.pose:
+                    draw_bone = draw_obj.pose.bones.get(pv_bone_name)
+                    if not draw_bone:
+                        continue
+                
+                pv_parent_matrix = get_current_parent_matrix(draw_obj, draw_bone)
+                
+                world_points = []
+                for v in vertices:
+                    try:
+                        p = pv_parent_matrix @ v
+                        px = p[0]
+                        py = p[1]
+                        pz = p[2]
+                        if (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
+                            abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
+                            world_points.append((px, py, pz))
+                    except Exception:
+                        continue
+                
+                if len(world_points) >= 2:
+                    batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": world_points})
+                    shader.bind()
+                    shader.uniform_float("color", styles.path_color) 
+                    gpu.state.line_width_set(styles.path_width)
+                    batch.draw(shader)
+                
+                if styles.show_frame_points and world_points:
+                    draw_batched_billboard_circles(context, world_points, styles.frame_point_size / 2, styles.frame_point_color, shader, segments=8)
         
         _state.handle_points = []
         
         # Initialize Batch Collector
         collector = DrawCollector()
         
-        if obj.mode == 'POSE':
-            bones_to_draw = list(context.selected_pose_bones or [])
-            active_bone = context.active_pose_bone
-            if active_bone and active_bone not in bones_to_draw:
-                bones_to_draw.append(active_bone)
+        if obj and obj.mode == 'POSE':
+            try:
+                bones_to_draw = list(context.selected_pose_bones or [])
+                active_bone = context.active_pose_bone
+                if active_bone and active_bone not in bones_to_draw:
+                    bones_to_draw.append(active_bone)
+            except Exception:
+                bones_to_draw = []
             for bone in bones_to_draw:
-                bone_parent_matrix = get_current_parent_matrix(obj, bone)
-                draw_enhanced_path(context, obj, bone_parent_matrix, collector, bone=bone)
+                try:
+                    bone_parent_matrix = get_current_parent_matrix(obj, bone)
+                    draw_enhanced_path(context, obj, bone_parent_matrix, collector, bone=bone)
+                except Exception:
+                    continue
         else:
-            draw_enhanced_path(context, obj, parent_matrix, collector)
-            
+            for obj_name, obj_cache in _state.position_cache.items():
+                try:
+                    draw_obj = bpy.data.objects.get(obj_name)
+                    if not draw_obj:
+                        continue
+                    obj_parent_matrix = get_current_parent_matrix(draw_obj)
+                    draw_enhanced_path(context, draw_obj, obj_parent_matrix, collector, obj_name=obj_name)
+                except Exception:
+                    continue
+             
         # Submit Batches
         collector.draw(context)
 
         # Draw origin indicator on top of motion path
-        if styles.show_origin_indicator:
+        if obj and styles.show_origin_indicator:
+            target_bone = None
+            if obj.mode == 'POSE':
+                target_bone = context.active_pose_bone
+                if not target_bone and context.selected_pose_bones:
+                    target_bone = context.selected_pose_bones[0]
             draw_origin_indicator(context, obj, target_bone, styles)
         
     except Exception as e:
@@ -837,17 +852,18 @@ def draw_motion_path_overlay():
         import traceback
         traceback.print_exc()
 
-def draw_enhanced_path(context, obj, parent_matrix, collector, bone=None):
+def draw_enhanced_path(context, obj, parent_matrix, collector, bone=None, obj_name=None):
     """Draw advanced motion path keyframe points and handles for an object or a pose bone."""
     global _state
     cache_key = bone.name if bone else None
-    if cache_key not in _state.position_cache:
+    if obj_name is None:
+        obj_name = obj.name
+    obj_cache = _state.position_cache.get(obj_name, {})
+    if cache_key not in obj_cache:
         return
     bone_name = bone.name if bone else None
     action = obj.animation_data.action if obj.animation_data else None
 
-    # Pre-build frame→keyframe lookup to avoid O(frames × fcurves) scanning in the draw loop.
-    # frame_keyframe_map: {frame_int: {array_index: BezierKeyframePoint}}
     frame_keyframe_map = {}
     frame_selected = set()
     if action:
@@ -861,7 +877,7 @@ def draw_enhanced_path(context, obj, parent_matrix, collector, bone=None):
                     if keyframe.select_control_point:
                         frame_selected.add(f)
 
-    for frame_num, cache_data in _state.position_cache[cache_key].items():
+    for frame_num, cache_data in obj_cache[cache_key].items():
         local_point = cache_data['position']
         point_3d = parent_matrix @ local_point
         keyframes_for_location = frame_keyframe_map.get(frame_num, {})
@@ -872,13 +888,13 @@ def draw_enhanced_path(context, obj, parent_matrix, collector, bone=None):
             keyframes_for_location, action,
             None,
             bone=bone, parent_matrix=parent_matrix,
-            collector=collector
+            collector=collector, obj_name=obj_name
         )
 
 def draw_motion_path_point(context, point_3d, frame_num,
                            is_keyframe_point, is_selected_keyframe,
                            keyframes_for_location, action,
-                           shader, bone=None, parent_matrix=None, collector=None):
+                           shader, bone=None, parent_matrix=None, collector=None, obj_name=None):
     """Draw motion path points, with handles if needed"""
     global _state
     wm = context.window_manager
@@ -918,12 +934,12 @@ def draw_motion_path_point(context, point_3d, frame_num,
     
     if is_selected_keyframe:
         if is_keyframe_point and keyframes_for_location:
-            draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, frame_num, bone=bone, parent_matrix=parent_matrix, collector=collector)
+            draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, frame_num, bone=bone, parent_matrix=parent_matrix, collector=collector, obj_name=obj_name)
 
     if collector:
         collector.add_circle(point_3d, size / 2, color)
 
-def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, frame_num, bone=None, parent_matrix=None, collector=None):
+def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, frame_num, bone=None, parent_matrix=None, collector=None, obj_name=None):
     """Draw motion path handles with individual control points"""
     global _state
     wm = context.window_manager
@@ -973,7 +989,8 @@ def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, 
         'position': handle_left_pos,
         'side': 'left',
         'frame': frame_num,
-        'bone': bone
+        'bone_name': bone.name if bone else None,
+        'obj_name': obj_name
     })
     is_selected = (_state.selected_handle_point == len(_state.handle_points) - 1 and 
                   _state.handle_dragging)
@@ -988,7 +1005,8 @@ def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, 
         'position': handle_right_pos,
         'side': 'right',
         'frame': frame_num,
-        'bone': bone
+        'bone_name': bone.name if bone else None,
+        'obj_name': obj_name
     })
     is_selected = (_state.selected_handle_point == len(_state.handle_points) - 1 and 
                   _state.handle_dragging)
@@ -1073,23 +1091,15 @@ def on_depsgraph_update(scene, depsgraph):
             return
 
         try:
-            # Only update if there is an active object
-            if bpy.context.active_object:
-                # Detect Interaction: Object updated but Action (keyframes) did not.
-                # This usually means the user is moving the object (G/Gizmo) but hasn't keyed it yet.
+            has_relevant_objects = (bpy.context.active_object or bpy.context.selected_objects)
+            if has_relevant_objects:
                 is_interaction_update = is_object_updated and not is_action_updated
                 
-                # If we are in interaction mode, SKIP calculation entirely.
-                # This reuses the existing cache (old path) for both Fast and Slow paths,
-                # ensuring smooth object movement without lag or state resets.
                 if is_interaction_update:
                     return
 
-                # No need to manage lock manually here anymore.
-                # build_position_cache handles atomic locking internally.
                 build_position_cache(bpy.context)
                 
-                # Tag redraw for all 3D views
                 for window in wm.windows:
                     for area in window.screen.areas:
                         if area.type == 'VIEW_3D':
@@ -1116,6 +1126,7 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         wm = context.window_manager
         self._last_keyframe_values = self._get_keyframe_values(context)
         self._last_active_obj_name = context.active_object.name if context.active_object else None
+        self._last_selected_obj_names = self._get_selected_obj_names(context)
         self._last_bone_selection = self._get_bone_selection_state(context)
         self._needs_update = False
         
@@ -1136,20 +1147,26 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
     def modal(self, context, event):
         wm = context.window_manager
 
-        # Detect active object switch (Object mode)
+        # Detect active object switch
         active_obj = context.active_object
         current_obj_name = active_obj.name if active_obj else None
         if current_obj_name != self._last_active_obj_name:
             self._last_active_obj_name = current_obj_name
-            # Clear stale selection/drag state from the previous object
             _state.selected_path_point = None
             _state.selected_frame = None
             _state.selected_handle_side = None
-            _state.selected_bone = None
+            _state.selected_bone_name = None
             _state.selected_handle_point = None
             _state.selected_handle_data = None
             _state.is_dragging = False
             _state.handle_dragging = False
+            _state.selected_drag_object_name = None
+            self._needs_update = True
+
+        # Detect selected objects change (Object mode)
+        current_selected = self._get_selected_obj_names(context)
+        if current_selected != self._last_selected_obj_names:
+            self._last_selected_obj_names = current_selected
             self._needs_update = True
 
         # Check bone selection changes (Pose mode)
@@ -1209,22 +1226,32 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         return values
 
     def _get_keyframe_values(self, context):
-        active_object = context.active_object
-        if not active_object:
-            return None
-        
         all_values = []
         
-        # Current object
-        all_values.extend(self._collect_object_keyframes(active_object))
-        
-        # Parent objects
-        parent = active_object.parent
-        while parent:
-            all_values.extend(self._collect_object_keyframes(parent))
-            parent = parent.parent
+        active_object = context.active_object
+        if active_object and active_object.mode == 'POSE':
+            all_values.extend(self._collect_object_keyframes(active_object))
+        else:
+            seen = set()
+            for obj in (context.selected_objects or []):
+                if obj.name in seen:
+                    continue
+                seen.add(obj.name)
+                all_values.extend(self._collect_object_keyframes(obj))
+                parent = obj.parent
+                while parent:
+                    if parent.name not in seen:
+                        seen.add(parent.name)
+                        all_values.extend(self._collect_object_keyframes(parent))
+                    parent = parent.parent
+            if active_object and active_object.name not in seen:
+                all_values.extend(self._collect_object_keyframes(active_object))
             
         return tuple(all_values) if all_values else None
+    
+    def _get_selected_obj_names(self, context):
+        """Get sorted tuple of selected object names for change detection."""
+        return tuple(sorted(obj.name for obj in context.selected_objects)) if context.selected_objects else ()
     
     def _get_bone_selection_state(self, context):
         """Get current bone selection state"""
@@ -1466,12 +1493,12 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     _state.selected_frame = hit_frame
                     
                     if context.mode == 'POSE':
-                        _state.selected_bone = hit_bone
+                        _state.selected_bone_name = hit_bone.name if hit_bone else None
                     
-                    obj = context.active_object
+                    obj = _get_drag_obj(context)
                     if obj and obj.animation_data and obj.animation_data.action:
                         action = obj.animation_data.action
-                        bone_name = _state.selected_bone.name if context.mode == 'POSE' and _state.selected_bone else None
+                        bone_name = _state.selected_bone_name if context.mode == 'POSE' else None
                         
                         if not event.shift and not event.ctrl:
                             for fc in get_fcurves(action):
@@ -1513,16 +1540,17 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     _state.handle_dragging = True
                     _state.drag_start_3d = handle_point['position']
                     _state.drag_start_item_pos = handle_point['position']
-                    # Store local mouse pos
                     _state.drag_start_mouse = local_mouse_pos
                     
-                    # Capture initial values
-                    self.capture_initial_handle_values(context, handle_point['frame'], handle_point['bone'].name if handle_point['bone'] else None, handle_point['side'])
+                    hp_obj_name = handle_point.get('obj_name')
+                    _state.selected_drag_object_name = hp_obj_name or None
                     
-                    obj = context.active_object
+                    self.capture_initial_handle_values(context, handle_point['frame'], handle_point.get('bone_name'), handle_point['side'])
+                    
+                    obj = _get_drag_obj(context)
                     if obj and obj.animation_data and obj.animation_data.action:
                         action = obj.animation_data.action
-                        bone_name = handle_point['bone'].name if handle_point['bone'] else None
+                        bone_name = handle_point.get('bone_name')
                         frame = handle_point['frame']
                         
                         if not event.shift:
@@ -1548,19 +1576,17 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     _state.selected_handle_side = hit_side
                     _state.drag_start_3d = point_3d  
                     _state.drag_start_item_pos = hit_handle_pos
-                    # Store local mouse pos
                     _state.drag_start_mouse = local_mouse_pos
                     
-                    # Capture initial values
                     self.capture_initial_handle_values(context, hit_frame, hit_bone.name if hit_bone else None, hit_side)
                     
                     if context.mode == 'POSE':
-                        _state.selected_bone = hit_bone
+                        _state.selected_bone_name = hit_bone.name if hit_bone else None
                     
-                    obj = context.active_object
+                    obj = _get_drag_obj(context)
                     if obj and obj.animation_data and obj.animation_data.action:
                         action = obj.animation_data.action
-                        bone_name = _state.selected_bone.name if context.mode == 'POSE' and _state.selected_bone else None
+                        bone_name = _state.selected_bone_name if context.mode == 'POSE' else None
                         
                         for fc in get_fcurves(action):
                             if is_location_fcurve(fc, bone_name):
@@ -1584,12 +1610,12 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     _state.drag_start_mouse = local_mouse_pos
                     
                     if context.mode == 'POSE':
-                        _state.selected_bone = hit_bone
+                        _state.selected_bone_name = hit_bone.name if hit_bone else None
                     
-                    obj = context.active_object
+                    obj = _get_drag_obj(context)
                     if obj and obj.animation_data and obj.animation_data.action:
                         action = obj.animation_data.action
-                        bone_name = _state.selected_bone.name if context.mode == 'POSE' and _state.selected_bone else None
+                        bone_name = _state.selected_bone_name if context.mode == 'POSE' else None
                         
                         if not event.shift and not event.ctrl:
                             for fc in get_fcurves(action):
@@ -1633,6 +1659,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     _state.selected_frame = None
                     _state.selected_handle_side = None
                     _state.drag_start_item_pos = None
+                    _state.selected_drag_object_name = None
                     
                     try:
                         build_position_cache(context)
@@ -1647,6 +1674,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     _state.handle_dragging = False
                     _state.selected_handle_point = None
                     _state.drag_start_item_pos = None
+                    _state.selected_drag_object_name = None
                     
                     try:
                         build_position_cache(context)
@@ -1698,19 +1726,18 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         return {'CANCELLED'}
     
     def move_selected_points(self, context, offset):
-        # Validate input to prevent crash
         if not all(math.isfinite(c) and abs(c) < SAFE_LIMIT for c in offset):
             return
 
-        obj = context.active_object
+        obj = _get_drag_obj(context)
         if not obj or not obj.animation_data or not obj.animation_data.action:
             return
         
         # bpy.ops.ed.undo_push(message="Move Motion Path Points")
         
         action = obj.animation_data.action
-        bone = _state.selected_bone
-        bone_name = bone.name if bone else None
+        bone_name = _state.selected_bone_name
+        bone = (obj.pose.bones.get(bone_name) if (bone_name and obj.mode == 'POSE' and obj.pose) else None)
         
         # Calculate parent matrix inverse to transform World Offset -> Local Offset (Parent Space)
         parent_matrix = get_current_parent_matrix(obj, bone)
@@ -1750,11 +1777,10 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 fcurve.update()
     
     def move_selected_handles(self, context, total_offset_world, side):
-        # Validate input to prevent crash
         if not all(math.isfinite(c) and abs(c) < SAFE_LIMIT for c in total_offset_world):
             return
 
-        obj = context.active_object
+        obj = _get_drag_obj(context)
         if not obj or not obj.animation_data or not obj.animation_data.action:
             return
         
@@ -1763,8 +1789,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         action = obj.animation_data.action
         frame = _state.selected_frame
         global_scale = context.window_manager.global_handle_visual_scale
-        bone = _state.selected_bone
-        bone_name = bone.name if bone else None
+        bone_name = _state.selected_bone_name
+        bone = (obj.pose.bones.get(bone_name) if (bone_name and obj.mode == 'POSE' and obj.pose) else None)
         
         # Use helper to get current parent matrix
         parent_matrix = get_current_parent_matrix(obj, bone)
@@ -1891,11 +1917,10 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
     
     def move_handle_point(self, context, total_offset_world, handle_point):
         """Move a handle control point using total offset from initial position"""
-        # Validate input to prevent crash
         if not all(math.isfinite(c) and abs(c) < SAFE_LIMIT for c in total_offset_world):
             return
 
-        obj = context.active_object
+        obj = _get_drag_obj(context)
         if not obj or not obj.animation_data or not obj.animation_data.action:
             return
         
@@ -1904,8 +1929,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         action = obj.animation_data.action
         frame = handle_point['frame']
         side = handle_point['side']
-        bone = handle_point['bone']
-        bone_name = bone.name if bone else None
+        bone_name = handle_point.get('bone_name')
+        bone = (obj.pose.bones.get(bone_name) if (bone_name and obj.mode == 'POSE' and obj.pose) else None)
         global_scale = context.window_manager.global_handle_visual_scale
         
         # Use helper
@@ -1973,19 +1998,19 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
     def get_keyframe_position_for_handle(self, context, handle_point):
         """Helper function to get the 3D position of the keyframe associated with a handle point."""
         global _state
-        obj = context.active_object
+        obj = _get_drag_obj(context)
         frame = handle_point['frame']
-        bone = handle_point['bone']
-        bone_name = bone.name if bone else None
+        bone_name = handle_point.get('bone_name')
         
-        if bone_name in _state.position_cache:
-            cache_data = _state.position_cache[bone_name].get(frame)
-            if cache_data:
-                return cache_data['position']
-        elif None in _state.position_cache:
-            cache_data = _state.position_cache[None].get(frame)
-            if cache_data:
-                return cache_data['position']
+        if not obj:
+            return mathutils.Vector((0, 0, 0))
+        
+        obj_cache = _state.position_cache.get(obj.name, {})
+        cache_key = bone_name if bone_name else None
+        sub_cache = obj_cache.get(cache_key, {})
+        cache_data = sub_cache.get(frame)
+        if cache_data:
+            return cache_data['position']
         
         return mathutils.Vector((0, 0, 0))
     
@@ -1994,7 +2019,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         global _state
         _state.initial_handle_values = {}
         
-        obj = context.active_object
+        obj = _get_drag_obj(context)
         if not obj or not obj.animation_data or not obj.animation_data.action:
             return
         
@@ -2035,18 +2060,15 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
 
         obj = context.active_object
         
-        if not obj or not obj.animation_data or not obj.animation_data.action:
+        if not obj:
             return None, None, None, None, None
         
-        action = obj.animation_data.action
-        
-        # Helper to check handles for a specific bone/object and frame
-        def check_handles_at_frame(bone_name, frame_num, point_3d, parent_matrix, bone_obj=None):
-            if not is_keyframe_at_frame(get_fcurves(action), frame_num, bone_name):
+        def check_handles_at_frame(bone_name, frame_num, point_3d, parent_matrix, check_action, bone_obj=None):
+            if not is_keyframe_at_frame(get_fcurves(check_action), frame_num, bone_name):
                 return None
             
             keyframes_for_location = {}
-            for fcurve in get_fcurves(action):
+            for fcurve in get_fcurves(check_action):
                 if is_location_fcurve(fcurve, bone_name):
                     for keyframe in fcurve.keyframe_points:
                         if abs(keyframe.co[0] - frame_num) < 0.5:
@@ -2071,39 +2093,42 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             
             global_scale = context.window_manager.global_handle_visual_scale
             
-            # Check Left Handle
-            handle_left_pos = point_3d + (world_vector_left * global_scale)
-            screen_pos = view3d_utils.location_3d_to_region_2d(region, rv3d, handle_left_pos)
-            if screen_pos and (mouse_pos - screen_pos).length < HANDLE_SELECT_RADIUS:
-                return 'left', handle_left_pos
+            if world_vector_left.length > 1e-4:
+                handle_left_pos = point_3d + (world_vector_left * global_scale)
+                screen_pos = view3d_utils.location_3d_to_region_2d(region, rv3d, handle_left_pos)
+                if screen_pos and (mouse_pos - screen_pos).length < HANDLE_SELECT_RADIUS:
+                    return 'left', handle_left_pos
             
-            # Check Right Handle
-            handle_right_pos = point_3d + (world_vector_right * global_scale)
-            screen_pos = view3d_utils.location_3d_to_region_2d(region, rv3d, handle_right_pos)
-            if screen_pos and (mouse_pos - screen_pos).length < HANDLE_SELECT_RADIUS:
-                return 'right', handle_right_pos
+            if world_vector_right.length > 1e-4:
+                handle_right_pos = point_3d + (world_vector_right * global_scale)
+                screen_pos = view3d_utils.location_3d_to_region_2d(region, rv3d, handle_right_pos)
+                if screen_pos and (mouse_pos - screen_pos).length < HANDLE_SELECT_RADIUS:
+                    return 'right', handle_right_pos
             
             return None
 
         if obj.mode == 'POSE':
-            # Check selected bones
-            bones_to_check = list(context.selected_pose_bones)
+            if not obj.animation_data or not obj.animation_data.action:
+                return None, None, None, None, None
+            action = obj.animation_data.action
+            obj_cache = _state.position_cache.get(obj.name, {})
+            
+            bones_to_check = list(context.selected_pose_bones or [])
             active_bone = context.active_pose_bone
             if active_bone and active_bone not in bones_to_check:
                 bones_to_check.append(active_bone)
                 
             for bone in bones_to_check:
                 bone_name = bone.name
-                if bone_name not in _state.position_cache:
+                if bone_name not in obj_cache:
                     continue
                 
                 parent_matrix = get_current_parent_matrix(obj, bone)
                 
-                for frame_num, cache_data in _state.position_cache[bone_name].items():
-                    # Transform cached local position to world
+                for frame_num, cache_data in obj_cache[bone_name].items():
                     point_3d = parent_matrix @ cache_data['position']
                     
-                    result = check_handles_at_frame(bone_name, frame_num, point_3d, parent_matrix, bone)
+                    result = check_handles_at_frame(bone_name, frame_num, point_3d, parent_matrix, action, bone)
                     if result:
                         side, handle_pos = result
                         return side, handle_pos, frame_num, point_3d, bone
@@ -2111,20 +2136,21 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             return None, None, None, None, None
             
         else:
-            # Object Mode
-            if None not in _state.position_cache:
-                return None, None, None, None, None
-            
-            parent_matrix = get_current_parent_matrix(obj)
-            
-            for frame_num, cache_data in _state.position_cache[None].items():
-                # Transform cached local position to world
-                point_3d = parent_matrix @ cache_data['position']
-                
-                result = check_handles_at_frame(None, frame_num, point_3d, parent_matrix)
-                if result:
-                    side, handle_pos = result
-                    return side, handle_pos, frame_num, point_3d, None
+            for cache_obj_name, cache_obj_data in _state.position_cache.items():
+                draw_obj = bpy.data.objects.get(cache_obj_name)
+                if not draw_obj or None not in cache_obj_data:
+                    continue
+                draw_action = draw_obj.animation_data.action if draw_obj.animation_data else None
+                if not draw_action:
+                    continue
+                parent_matrix = get_current_parent_matrix(draw_obj)
+                for frame_num, cache_data in cache_obj_data[None].items():
+                    point_3d = parent_matrix @ cache_data['position']
+                    result = check_handles_at_frame(None, frame_num, point_3d, parent_matrix, draw_action)
+                    if result:
+                        side, handle_pos = result
+                        _state.selected_drag_object_name = draw_obj.name
+                        return side, handle_pos, frame_num, point_3d, None
         
         return None, None, None, None, None
     
@@ -2146,14 +2172,21 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         if not obj:
             return None, None, None
         
+        obj_cache = _state.position_cache.get(obj.name, {})
+        
         if obj.mode == 'POSE':
-            for bone in context.selected_pose_bones:
-                if bone.name not in _state.position_cache:
+            bones_to_check = list(context.selected_pose_bones or [])
+            active_bone = context.active_pose_bone
+            if active_bone and active_bone not in bones_to_check:
+                bones_to_check.append(active_bone)
+            
+            for bone in bones_to_check:
+                if bone.name not in obj_cache:
                     continue
                 
                 parent_matrix = get_current_parent_matrix(obj, bone)
                 
-                for frame_num, cache_data in _state.position_cache[bone.name].items():
+                for frame_num, cache_data in obj_cache[bone.name].items():
                     local_pos = cache_data['position']
                     world_pos = parent_matrix @ local_pos
                     
@@ -2161,35 +2194,20 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     if screen_pos and (mouse_pos - screen_pos).length < HANDLE_SELECT_RADIUS:
                         return world_pos, frame_num, bone
             
-            active_bone = context.active_pose_bone
-            if active_bone:
-                if active_bone.name not in _state.position_cache:
-                    return None, None, None
-                
-                parent_matrix = get_current_parent_matrix(obj, active_bone)
-                
-                for frame_num, cache_data in _state.position_cache[active_bone.name].items():
-                    local_pos = cache_data['position']
-                    world_pos = parent_matrix @ local_pos
-                    
-                    screen_pos = view3d_utils.location_3d_to_region_2d(region, rv3d, world_pos)
-                    if screen_pos and (mouse_pos - screen_pos).length < HANDLE_SELECT_RADIUS:
-                        return world_pos, frame_num, active_bone
-            
             return None, None, None
         else:
-            if None not in _state.position_cache:
-                return None, None, None
-            
-            parent_matrix = get_current_parent_matrix(obj)
-            
-            for frame_num, cache_data in _state.position_cache[None].items():
-                local_pos = cache_data['position']
-                world_pos = parent_matrix @ local_pos
-                
-                screen_pos = view3d_utils.location_3d_to_region_2d(region, rv3d, world_pos)
-                if screen_pos and (mouse_pos - screen_pos).length < HANDLE_SELECT_RADIUS:
-                    return world_pos, frame_num, None
+            for cache_obj_name, cache_obj_data in _state.position_cache.items():
+                draw_obj = bpy.data.objects.get(cache_obj_name)
+                if not draw_obj or None not in cache_obj_data:
+                    continue
+                parent_matrix = get_current_parent_matrix(draw_obj)
+                for frame_num, cache_data in cache_obj_data[None].items():
+                    local_pos = cache_data['position']
+                    world_pos = parent_matrix @ local_pos
+                    screen_pos = view3d_utils.location_3d_to_region_2d(region, rv3d, world_pos)
+                    if screen_pos and (mouse_pos - screen_pos).length < HANDLE_SELECT_RADIUS:
+                        _state.selected_drag_object_name = draw_obj.name
+                        return world_pos, frame_num, None
         
         return None, None, None
 
