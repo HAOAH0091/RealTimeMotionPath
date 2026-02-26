@@ -1173,6 +1173,8 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         current_bone_selection = self._get_bone_selection_state(context)
         if current_bone_selection != self._last_bone_selection:
             self._last_bone_selection = current_bone_selection
+            if current_bone_selection is None:
+                _state.selected_bone_name = None  # Clear when switching out of Pose mode
             self._needs_update = True
         
         # TIMER Mode Logic
@@ -1494,6 +1496,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     
                     if context.mode == 'POSE':
                         _state.selected_bone_name = hit_bone.name if hit_bone else None
+                    else:
+                        _state.selected_bone_name = None
                     
                     obj = _get_drag_obj(context)
                     if obj and obj.animation_data and obj.animation_data.action:
@@ -1582,6 +1586,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     
                     if context.mode == 'POSE':
                         _state.selected_bone_name = hit_bone.name if hit_bone else None
+                    else:
+                        _state.selected_bone_name = None
                     
                     obj = _get_drag_obj(context)
                     if obj and obj.animation_data and obj.animation_data.action:
@@ -1611,6 +1617,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     
                     if context.mode == 'POSE':
                         _state.selected_bone_name = hit_bone.name if hit_bone else None
+                    else:
+                        _state.selected_bone_name = None
                     
                     obj = _get_drag_obj(context)
                     if obj and obj.animation_data and obj.animation_data.action:
@@ -1736,7 +1744,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         # bpy.ops.ed.undo_push(message="Move Motion Path Points")
         
         action = obj.animation_data.action
-        bone_name = _state.selected_bone_name
+        bone_name = _state.selected_bone_name if (obj and obj.mode == 'POSE') else None
         bone = (obj.pose.bones.get(bone_name) if (bone_name and obj.mode == 'POSE' and obj.pose) else None)
         
         # Calculate parent matrix inverse to transform World Offset -> Local Offset (Parent Space)
@@ -1789,7 +1797,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         action = obj.animation_data.action
         frame = _state.selected_frame
         global_scale = context.window_manager.global_handle_visual_scale
-        bone_name = _state.selected_bone_name
+        bone_name = _state.selected_bone_name if (obj and obj.mode == 'POSE') else None
         bone = (obj.pose.bones.get(bone_name) if (bone_name and obj.mode == 'POSE' and obj.pose) else None)
         
         # Use helper to get current parent matrix
