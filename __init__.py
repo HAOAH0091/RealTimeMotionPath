@@ -1529,7 +1529,11 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                         action = obj.animation_data.action
                         bone_name = _state.selected_bone_name if context.mode == 'POSE' else None
                         
-                        if not event.shift and not event.ctrl:
+                        # 检查右键命中的关键帧是否已选中
+                        hit_keyframe_already_selected = is_keyframe_selected(action, bone_name, hit_frame)
+                        
+                        # 只有右键点击未选中的关键帧时才清除其他选中状态
+                        if not hit_keyframe_already_selected:
                             for fc in get_fcurves(action):
                                 for kp in fc.keyframe_points:
                                     kp.select_control_point = False
@@ -1578,23 +1582,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     
                     self.capture_initial_handle_values(context, handle_point['frame'], handle_point.get('bone_name'), handle_point['side'])
                     
-                    obj = _get_drag_obj(context)
-                    if obj and obj.animation_data and obj.animation_data.action:
-                        action = obj.animation_data.action
-                        bone_name = handle_point.get('bone_name')
-                        frame = handle_point['frame']
-                        
-                        if not event.shift:
-                            for fc in get_fcurves(action):
-                                for kp in fc.keyframe_points:
-                                    kp.select_control_point = False
-                        
-                        for fc in get_fcurves(action):
-                            if is_location_fcurve(fc, bone_name):
-                                for kp in fc.keyframe_points:
-                                    if abs(kp.co[0] - frame) < 0.5:
-                                        kp.select_control_point = True
-                                        break
+                    # 手柄点击时不改变关键帧的选中状态
+                    # 保持用户已有的多选状态，只操作手柄
                     
                     if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
                         area_to_redraw.tag_redraw()
@@ -1652,7 +1641,11 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                         action = obj.animation_data.action
                         bone_name = _state.selected_bone_name if context.mode == 'POSE' else None
                         
-                        if not event.shift and not event.ctrl:
+                        # 检查点击的关键帧是否已选中
+                        hit_keyframe_already_selected = is_keyframe_selected(action, bone_name, hit_frame)
+                        
+                        # 只有未按住 Shift/Ctrl 且点击未选中的关键帧时才清除其他选中状态
+                        if not hit_keyframe_already_selected and not event.shift and not event.ctrl:
                             for fc in get_fcurves(action):
                                 for kp in fc.keyframe_points:
                                     kp.select_control_point = False
@@ -1685,6 +1678,34 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
                         area_to_redraw.tag_redraw()
                     return {'RUNNING_MODAL'}
+                
+                # 点击空白区域检测：所有命中检测都未命中
+                # - handle_index is None（未命中手柄点）
+                # - 手柄 hit_frame is None（未命中手柄）
+                # - 关键帧 hit_frame is None（未命中关键帧）
+                # 清除所有选中状态
+                if context.mode == 'POSE':
+                    obj = context.active_object
+                    if obj and obj.animation_data and obj.animation_data.action:
+                        action = obj.animation_data.action
+                        selected_bones = list(context.selected_pose_bones or [])
+                        for bone in selected_bones:
+                            for fc in get_fcurves(action):
+                                if is_location_fcurve(fc, bone.name):
+                                    for kp in fc.keyframe_points:
+                                        kp.select_control_point = False
+                else:
+                    # Object 模式：清除所有选中对象的关键帧选中状态
+                    selected_objects = list(context.selected_objects or [])
+                    for obj in selected_objects:
+                        if obj.animation_data and obj.animation_data.action:
+                            action = obj.animation_data.action
+                            for fc in get_fcurves(action):
+                                for kp in fc.keyframe_points:
+                                    kp.select_control_point = False
+                
+                if area_to_redraw and area_to_redraw.type == 'VIEW_3D':
+                    area_to_redraw.tag_redraw()
                     
             elif event.value == 'RELEASE':
                 if _state.is_dragging:
@@ -2272,35 +2293,73 @@ def get_handle_point_at_mouse(context, event, region=None, rv3d=None, local_mous
             return i, handle_point
     return None, None
 
+def is_keyframe_selected(action, bone_name, frame):
+    """Check if the keyframe at the specified frame is selected.
+    
+    Args:
+        action: The action containing the fcurves
+        bone_name: The bone name (for pose mode) or None (for object mode)
+        frame: The frame number to check
+        
+    Returns:
+        bool: True if the keyframe is selected, False otherwise
+    """
+    for fc in get_fcurves(action):
+        if is_location_fcurve(fc, bone_name):
+            for kp in fc.keyframe_points:
+                if abs(kp.co[0] - frame) < 0.5:
+                    return kp.select_control_point
+    return False
+
 def set_handle_type(context, handle_type):
-    """Set handle type for selected keyframes and apply interactions"""
-    obj = context.active_object
-    if not obj or not obj.animation_data or not obj.animation_data.action:
-        return
-    action = obj.animation_data.action
-    bone_name = None
-    if obj.mode == 'POSE':
-        bone = context.active_pose_bone
-        if bone:
-            bone_name = bone.name
-    for fcurve in get_fcurves(action):
-        if not is_location_fcurve(fcurve, bone_name):
-            continue
-        for keyframe in fcurve.keyframe_points:
-            if keyframe.select_control_point:
-                keyframe.handle_left_type = handle_type
-                keyframe.handle_right_type = handle_type
-                if handle_type == 'ALIGNED' or handle_type in {'AUTO', 'AUTO_CLAMPED'}:
-                    vec = mathutils.Vector(keyframe.co) - mathutils.Vector(keyframe.handle_left)
-                    # Keep original length of the right handle
-                    len_right = (mathutils.Vector(keyframe.handle_right) - mathutils.Vector(keyframe.co)).length
-                    if vec.length > 0.0001:
-                        vec.normalize()
-                        keyframe.handle_right = mathutils.Vector(keyframe.co) + vec * len_right
-                elif handle_type == 'VECTOR':
-                    keyframe.handle_left[1] = keyframe.co[1]
-                    keyframe.handle_right[1] = keyframe.co[1]
-        fcurve.update()
+    """Set handle type for selected keyframes across all selected objects/bones"""
+
+    # 收集所有需要处理的对象和骨骼
+    targets = []
+
+    if context.mode == 'POSE':
+        # Pose 模式：处理所有选中骨骼
+        obj = context.active_object
+        if obj and obj.type == 'ARMATURE':
+            selected_bones = list(context.selected_pose_bones or [])
+            if selected_bones:
+                for bone in selected_bones:
+                    targets.append((obj, bone.name))
+            elif context.active_pose_bone:
+                targets.append((obj, context.active_pose_bone.name))
+    else:
+        # Object 模式：处理所有选中对象
+        selected_objects = list(context.selected_objects or [])
+        if selected_objects:
+            for obj in selected_objects:
+                if obj.animation_data and obj.animation_data.action:
+                    targets.append((obj, None))
+        else:
+            obj = context.active_object
+            if obj and obj.animation_data and obj.animation_data.action:
+                targets.append((obj, None))
+
+    # 批量应用手柄类型
+    for obj, bone_name in targets:
+        action = obj.animation_data.action
+        for fcurve in get_fcurves(action):
+            if not is_location_fcurve(fcurve, bone_name):
+                continue
+            for keyframe in fcurve.keyframe_points:
+                if keyframe.select_control_point:
+                    keyframe.handle_left_type = handle_type
+                    keyframe.handle_right_type = handle_type
+                    if handle_type == 'ALIGNED' or handle_type in {'AUTO', 'AUTO_CLAMPED'}:
+                        vec = mathutils.Vector(keyframe.co) - mathutils.Vector(keyframe.handle_left)
+                        # Keep original length of the right handle
+                        len_right = (mathutils.Vector(keyframe.handle_right) - mathutils.Vector(keyframe.co)).length
+                        if vec.length > 0.0001:
+                            vec.normalize()
+                            keyframe.handle_right = mathutils.Vector(keyframe.co) + vec * len_right
+                    elif handle_type == 'VECTOR':
+                        keyframe.handle_left[1] = keyframe.co[1]
+                        keyframe.handle_right[1] = keyframe.co[1]
+            fcurve.update()
 
 
 
