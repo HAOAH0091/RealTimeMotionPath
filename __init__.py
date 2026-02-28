@@ -1688,17 +1688,24 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     obj = context.active_object
                     if obj and obj.animation_data and obj.animation_data.action:
                         action = obj.animation_data.action
-                        selected_bones = list(context.selected_pose_bones or [])
-                        for bone in selected_bones:
+                        # 从 position_cache 获取当前骨架的所有骨骼
+                        # 而不是只遍历 selected_pose_bones
+                        # 因为用户可能取消选中了骨骼，但关键帧选中状态仍然保留
+                        # 注意：当前只处理活动骨架（context.active_object）
+                        # 因为运动路径只显示活动骨架的骨骼
+                        obj_cache = _state.position_cache.get(obj.name, {})
+                        for bone_name in obj_cache.keys():
                             for fc in get_fcurves(action):
-                                if is_location_fcurve(fc, bone.name):
+                                if is_location_fcurve(fc, bone_name):
                                     for kp in fc.keyframe_points:
                                         kp.select_control_point = False
                 else:
-                    # Object 模式：清除所有选中对象的关键帧选中状态
-                    selected_objects = list(context.selected_objects or [])
-                    for obj in selected_objects:
-                        if obj.animation_data and obj.animation_data.action:
+                    # Object 模式：清除所有显示运动路径对象的关键帧选中状态
+                    # 使用 position_cache 中的对象，而不是 selected_objects
+                    # 因为用户可能取消选中了对象，但关键帧选中状态仍然保留
+                    for obj_name in _state.position_cache.keys():
+                        obj = bpy.data.objects.get(obj_name)
+                        if obj and obj.animation_data and obj.animation_data.action:
                             action = obj.animation_data.action
                             for fc in get_fcurves(action):
                                 for kp in fc.keyframe_points:
