@@ -52,6 +52,9 @@ class MotionPathState:
 
 _state = MotionPathState()
 
+def get_addon_prefs(context):
+    return context.preferences.addons[__package__].preferences
+
 def _get_drag_obj(context):
     """Safely resolve the drag-target object from its stored name. Never returns a stale RNA ref."""
     global _state
@@ -688,7 +691,7 @@ class DrawCollector:
             self.circles[key] = []
         self.circles[key].append(pos)
         
-    def draw(self, context):
+    def draw(self, context, styles):
         # Draw Lines (POLYLINE_SMOOTH_COLOR for anti-aliasing)
         if self.lines:
             try:
@@ -698,7 +701,7 @@ class DrawCollector:
                 viewport_size = gpu.state.viewport_get()[2:]
                 shader.uniform_float("viewportSize", viewport_size)
                 wm = context.window_manager
-                line_width = wm.motion_path_styles.handle_line_width if hasattr(wm, 'motion_path_styles') else 2.0
+                line_width = styles.handle_line_width
                 shader.uniform_float("lineWidth", line_width)
                 batch.draw(shader)
             except Exception as e:
@@ -794,7 +797,7 @@ def draw_motion_path_overlay():
         global _state
         obj = context.active_object
 
-        styles = wm.motion_path_styles
+        styles = get_addon_prefs(context)
 
         # Enable Alpha Blending for smoother edges
         gpu.state.blend_set('ALPHA')
@@ -859,7 +862,7 @@ def draw_motion_path_overlay():
             for bone in bones_to_draw:
                 try:
                     bone_parent_matrix = get_current_parent_matrix(obj, bone)
-                    draw_enhanced_path(context, obj, bone_parent_matrix, collector, bone=bone)
+                    draw_enhanced_path(context, obj, bone_parent_matrix, collector, styles, bone=bone)
                 except Exception:
                     continue
         else:
@@ -869,12 +872,12 @@ def draw_motion_path_overlay():
                     if not draw_obj:
                         continue
                     obj_parent_matrix = get_current_parent_matrix(draw_obj)
-                    draw_enhanced_path(context, draw_obj, obj_parent_matrix, collector, obj_name=obj_name)
+                    draw_enhanced_path(context, draw_obj, obj_parent_matrix, collector, styles, obj_name=obj_name)
                 except Exception:
                     continue
              
         # Submit Batches
-        collector.draw(context)
+        collector.draw(context, styles)
 
         # Draw origin indicator on top of motion path
         if obj and styles.show_origin_indicator:
@@ -890,7 +893,7 @@ def draw_motion_path_overlay():
         import traceback
         traceback.print_exc()
 
-def draw_enhanced_path(context, obj, parent_matrix, collector, bone=None, obj_name=None):
+def draw_enhanced_path(context, obj, parent_matrix, collector, styles, bone=None, obj_name=None):
     """Draw advanced motion path keyframe points and handles for an object or a pose bone."""
     global _state
     cache_key = bone.name if bone else None
@@ -924,7 +927,7 @@ def draw_enhanced_path(context, obj, parent_matrix, collector, bone=None, obj_na
             context, point_3d, frame_num,
             True, is_selected_keyframe,
             keyframes_for_location, action,
-            None,
+            None, styles,
             bone=bone, parent_matrix=parent_matrix,
             collector=collector, obj_name=obj_name
         )
@@ -932,11 +935,11 @@ def draw_enhanced_path(context, obj, parent_matrix, collector, bone=None, obj_na
 def draw_motion_path_point(context, point_3d, frame_num,
                            is_keyframe_point, is_selected_keyframe,
                            keyframes_for_location, action,
-                           shader, bone=None, parent_matrix=None, collector=None, obj_name=None):
+                           shader, styles, bone=None, parent_matrix=None, collector=None, obj_name=None):
     """Draw motion path points, with handles if needed"""
     global _state
     wm = context.window_manager
-    styles = wm.motion_path_styles
+    # styles passed as arg
     
     if _state.is_dragging and frame_num == _state.selected_frame:
         color = styles.selected_keyframe_point_color
@@ -972,7 +975,7 @@ def draw_motion_path_point(context, point_3d, frame_num,
     
     if is_selected_keyframe:
         if is_keyframe_point and keyframes_for_location:
-            draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, frame_num, bone=bone, parent_matrix=parent_matrix, collector=collector, obj_name=obj_name)
+            draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, styles, frame_num, bone=bone, parent_matrix=parent_matrix, collector=collector, obj_name=obj_name)
 
     if collector:
         collector.add_circle(point_3d, size / 2, color)
@@ -1018,11 +1021,11 @@ def get_handle_correction_factors(keyframes_for_location):
         
     return factors_left, factors_right
 
-def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, frame_num, bone=None, parent_matrix=None, collector=None, obj_name=None):
+def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, styles, frame_num, bone=None, parent_matrix=None, collector=None, obj_name=None):
     """Draw motion path handles with individual control points"""
     global _state
     wm = context.window_manager
-    styles = wm.motion_path_styles
+    # styles passed as arg
     global_scale = wm.global_handle_visual_scale
     
     # NOTE: point_3d is already in World Space (transformed in caller)
@@ -2482,7 +2485,70 @@ class MOTIONPATH_ToggleCustomDraw(bpy.types.Operator):
             context.area.tag_redraw()
         return {'FINISHED'}
 
-class MotionPathStyleSettings(bpy.types.PropertyGroup):
+class MOTIONPATH_ResetPreferences(bpy.types.Operator):
+    """Reset Motion Path Preferences to Default"""
+    bl_idname = "motion_path.reset_preferences"
+    bl_label = "Reset to Default"
+    bl_description = "Reset all motion path settings to default values"
+    bl_options = {'REGISTER', 'INTERNAL'}
+
+    def execute(self, context):
+        prefs = get_addon_prefs(context)
+        # Reset Path
+        prefs.property_unset("path_width")
+        prefs.property_unset("path_color")
+        # Reset Frame Points
+        prefs.property_unset("show_frame_points")
+        prefs.property_unset("frame_point_size")
+        prefs.property_unset("frame_point_color")
+        # Reset Keyframes
+        prefs.property_unset("keyframe_point_size")
+        prefs.property_unset("keyframe_point_color")
+        prefs.property_unset("selected_keyframe_point_color")
+        # Reset Handles
+        prefs.property_unset("handle_line_width")
+        prefs.property_unset("handle_line_color")
+        prefs.property_unset("selected_handle_line_color")
+        prefs.property_unset("handle_endpoint_size")
+        prefs.property_unset("handle_endpoint_color")
+        prefs.property_unset("selected_handle_endpoint_color")
+        # Reset Origin
+        prefs.property_unset("show_origin_indicator")
+        prefs.property_unset("origin_indicator_style")
+        prefs.property_unset("origin_indicator_size")
+        prefs.property_unset("origin_indicator_color")
+        prefs.property_unset("origin_indicator_inner_color")
+        
+        # Redraw
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        return {'FINISHED'}
+
+class MOTIONPATH_PT_header_settings(bpy.types.Panel):
+    bl_label = "Motion Path Settings"
+    bl_idname = "MOTIONPATH_PT_header_settings"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'HEADER'
+
+    def draw(self, context):
+        layout = self.layout
+        wm = context.window_manager
+        
+        layout.label(text=iface_("Performance"))
+        
+        layout.label(text=iface_("Update Mode"))
+        row = layout.row()
+        row.prop(wm, "motion_path_update_mode", expand=True)
+        
+        layout.prop(wm, "motion_path_fps_limit", text=iface_("Interaction FPS"))
+        if wm.motion_path_update_mode == 'TIMER':
+            layout.prop(wm, "auto_update_fps", text=iface_("Auto Update FPS"))
+
+class MOTIONPATH_AddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
     # Path
     path_width: bpy.props.FloatProperty(name="Path Width", default=2.0, min=1.0, max=10.0)
     path_color: bpy.props.FloatVectorProperty(name="Path Color", subtype='COLOR', size=4, default=(0.8, 0.0, 0.0, 1.0), min=0.0, max=1.0)
@@ -2520,69 +2586,50 @@ class MotionPathStyleSettings(bpy.types.PropertyGroup):
     origin_indicator_color: bpy.props.FloatVectorProperty(name="Origin Color", subtype='COLOR', size=4, default=(1.0, 1.0, 1.0, 0.9), min=0.0, max=1.0)
     origin_indicator_inner_color: bpy.props.FloatVectorProperty(name="Origin Inner Color", subtype='COLOR', size=4, default=(1.0, 0.4, 0.0, 1.0), min=0.0, max=1.0)
 
-class MOTIONPATH_PT_header_settings(bpy.types.Panel):
-    bl_label = "Motion Path Settings"
-    bl_idname = "MOTIONPATH_PT_header_settings"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'HEADER'
-
     def draw(self, context):
         layout = self.layout
-        wm = context.window_manager
+        prefs = self
         
-        layout.label(text=iface_("Performance"))
-        
-        layout.label(text=iface_("Update Mode"))
+        # Add Reset Button
         row = layout.row()
-        row.prop(wm, "motion_path_update_mode", expand=True)
-        
-        layout.prop(wm, "motion_path_fps_limit", text=iface_("Interaction FPS"))
-        if wm.motion_path_update_mode == 'TIMER':
-            layout.prop(wm, "auto_update_fps", text=iface_("Auto Update FPS"))
+        row.alignment = 'RIGHT'
+        row.operator("motion_path.reset_preferences", text=iface_("Restore Defaults"), icon='LOOP_BACK')
 
-class MOTIONPATH_AddonPreferences(bpy.types.AddonPreferences):
-    bl_idname = __name__
-
-    def draw(self, context):
-        layout = self.layout
-        wm = context.window_manager
-        styles = wm.motion_path_styles
-        
         col = layout.column()
         col.label(text=iface_("Style Settings"))
-        col.prop(styles, "path_width")
-        col.prop(styles, "path_color")
+        col.prop(prefs, "path_width")
+        col.prop(prefs, "path_color")
         
         col.separator()
-        col.prop(styles, "show_frame_points")
-        if styles.show_frame_points:
-            col.prop(styles, "frame_point_size")
-            col.prop(styles, "frame_point_color")
+        col.prop(prefs, "show_frame_points")
+        if prefs.show_frame_points:
+            col.prop(prefs, "frame_point_size")
+            col.prop(prefs, "frame_point_color")
             
         col.separator()
         col.label(text=iface_("Keyframes"))
-        col.prop(styles, "keyframe_point_size")
-        col.prop(styles, "keyframe_point_color")
-        col.prop(styles, "selected_keyframe_point_color")
+        col.prop(prefs, "keyframe_point_size")
+        col.prop(prefs, "keyframe_point_color")
+        col.prop(prefs, "selected_keyframe_point_color")
         
         col.separator()
         col.label(text=iface_("Handles"))
-        col.prop(styles, "handle_line_width")
-        col.prop(styles, "handle_line_color")
-        col.prop(styles, "selected_handle_line_color")
-        col.prop(styles, "handle_endpoint_size")
-        col.prop(styles, "handle_endpoint_color")
-        col.prop(styles, "selected_handle_endpoint_color")
+        col.prop(prefs, "handle_line_width")
+        col.prop(prefs, "handle_line_color")
+        col.prop(prefs, "selected_handle_line_color")
+        col.prop(prefs, "handle_endpoint_size")
+        col.prop(prefs, "handle_endpoint_color")
+        col.prop(prefs, "selected_handle_endpoint_color")
 
         col.separator()
         col.label(text=iface_("Origin Indicator"))
-        col.prop(styles, "show_origin_indicator")
-        if styles.show_origin_indicator:
-            col.prop(styles, "origin_indicator_style")
-            col.prop(styles, "origin_indicator_size")
-            col.prop(styles, "origin_indicator_color")
-            if styles.origin_indicator_style in {'RING_DOT', 'DOT'}:
-                col.prop(styles, "origin_indicator_inner_color")
+        col.prop(prefs, "show_origin_indicator")
+        if prefs.show_origin_indicator:
+            col.prop(prefs, "origin_indicator_style")
+            col.prop(prefs, "origin_indicator_size")
+            col.prop(prefs, "origin_indicator_color")
+            if prefs.origin_indicator_style in {'RING_DOT', 'DOT'}:
+                col.prop(prefs, "origin_indicator_inner_color")
 
 class MOTIONPATH_MT_context_menu(bpy.types.Menu):
     bl_label = "Motion Path Context Menu"
@@ -2714,7 +2761,7 @@ def draw_header_button(self, context):
 
 classes = (
     MOTIONPATH_ToggleCustomDraw,
-    MotionPathStyleSettings,
+    MOTIONPATH_ResetPreferences,
     MOTIONPATH_PT_header_settings,
     MOTIONPATH_AddonPreferences,
     MOTIONPATH_MT_context_menu,
@@ -2743,7 +2790,7 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     
-    bpy.types.WindowManager.motion_path_styles = bpy.props.PointerProperty(type=MotionPathStyleSettings)
+
 
     bpy.types.WindowManager.custom_path_draw_active = bpy.props.BoolProperty(
         name="Enable Motion Path",
@@ -2826,7 +2873,7 @@ def unregister():
     for cls in classes:
         bpy.utils.unregister_class(cls)
         
-    del bpy.types.WindowManager.motion_path_styles
+
     del bpy.types.WindowManager.custom_path_draw_active
     del bpy.types.WindowManager.direct_manipulation_active
     del bpy.types.WindowManager.auto_update_active
