@@ -70,6 +70,8 @@ _is_updating_cache = False
 
 HANDLE_SELECT_RADIUS = 20
 SAFE_LIMIT = 1000000.0
+MIN_HANDLE_SCALE = 0.1
+MAX_HANDLE_SCALE = 100.0
 
 def get_fcurves(action):
     try:
@@ -336,31 +338,40 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
         base = 0
         for pos in batch_points:
             try:
-                px, py, pz = pos[0], pos[1], pos[2]
+                # Safer unpacking with explicit float conversion
+                # This detaches values from C-backed Vector objects to prevent Access Violations
+                px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
+                
+                if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
+                        abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
+                    continue
+
+                scale = get_pixel_scale(context, (px, py, pz), radius_in_pixels)
+                if scale == 0:
+                    continue
+                
+                c1 = (px - scale * rx - scale * ux, py - scale * ry - scale * uy, pz - scale * rz - scale * uz)
+                c2 = (px + scale * rx - scale * ux, py + scale * ry - scale * uy, pz + scale * rz - scale * uz)
+                c3 = (px + scale * rx + scale * ux, py + scale * ry + scale * uy, pz + scale * rz + scale * uz)
+                c4 = (px - scale * rx + scale * ux, py - scale * ry + scale * uy, pz - scale * rz + scale * uz)
+                
+                valid = True
+                for v in (c1, c2, c3, c4):
+                    if not (math.isfinite(v[0]) and math.isfinite(v[1]) and math.isfinite(v[2]) and
+                            abs(v[0]) < SAFE_LIMIT and abs(v[1]) < SAFE_LIMIT and abs(v[2]) < SAFE_LIMIT):
+                        valid = False
+                        break
+                if not valid:
+                    continue
+                    
+                all_verts.extend((c1, c2, c3, c4))
+                all_uvs.extend(uv_quad)
+                all_indices.extend(((base, base + 1, base + 2), (base, base + 2, base + 3)))
+                base += 4
             except Exception:
+                # Catch errors for individual points to protect the batch
                 continue
-            if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
-                    abs(px) < SAFE_LIMIT and abs(py) < SAFE_LIMIT and abs(pz) < SAFE_LIMIT):
-                continue
-            scale = get_pixel_scale(context, pos, radius_in_pixels)
-            if scale == 0:
-                continue
-            c1 = (px - scale * rx - scale * ux, py - scale * ry - scale * uy, pz - scale * rz - scale * uz)
-            c2 = (px + scale * rx - scale * ux, py + scale * ry - scale * uy, pz + scale * rz - scale * uz)
-            c3 = (px + scale * rx + scale * ux, py + scale * ry + scale * uy, pz + scale * rz + scale * uz)
-            c4 = (px - scale * rx + scale * ux, py - scale * ry + scale * uy, pz - scale * rz + scale * uz)
-            valid = True
-            for v in (c1, c2, c3, c4):
-                if not (math.isfinite(v[0]) and math.isfinite(v[1]) and math.isfinite(v[2]) and
-                        abs(v[0]) < SAFE_LIMIT and abs(v[1]) < SAFE_LIMIT and abs(v[2]) < SAFE_LIMIT):
-                    valid = False
-                    break
-            if not valid:
-                continue
-            all_verts.extend((c1, c2, c3, c4))
-            all_uvs.extend(uv_quad)
-            all_indices.extend(((base, base + 1, base + 2), (base, base + 2, base + 3)))
-            base += 4
+                
         if not all_verts or not all_indices:
             continue
         try:
@@ -966,6 +977,47 @@ def draw_motion_path_point(context, point_3d, frame_num,
     if collector:
         collector.add_circle(point_3d, size / 2, color)
 
+def get_handle_correction_factors(keyframes_for_location):
+    """
+    Calculate correction factors for handles based on time difference (dt).
+    Returns (factors_left, factors_right) where factor = S / dt.
+    S is the average time duration of all handles.
+    
+    Includes clamping to prevent numerical explosion when dt is extremely small 
+    (e.g., vertical handles), which can cause 3D view artifacts or crashes.
+    """
+    dt_values = []
+    
+    # 1. Collect all valid dt values
+    for array_index, keyframe in keyframes_for_location.items():
+        dt_l = abs(keyframe.handle_left[0] - keyframe.co[0])
+        dt_r = abs(keyframe.handle_right[0] - keyframe.co[0])
+        if dt_l > 0.001: dt_values.append(dt_l)
+        if dt_r > 0.001: dt_values.append(dt_r)
+        
+    # 2. Calculate Reference Scale S
+    if not dt_values:
+        S = 1.0
+    else:
+        S = sum(dt_values) / len(dt_values)
+        
+    # 3. Calculate Factors
+    factors_left = {}
+    factors_right = {}
+    
+    for array_index, keyframe in keyframes_for_location.items():
+        dt_l = abs(keyframe.handle_left[0] - keyframe.co[0])
+        dt_r = abs(keyframe.handle_right[0] - keyframe.co[0])
+        
+        factors_left[array_index] = S / dt_l if dt_l > 0.001 else 1.0
+        factors_right[array_index] = S / dt_r if dt_r > 0.001 else 1.0
+        
+        # Clamp factors to prevent explosion (e.g. if dt is very small but > 0.001)
+        factors_left[array_index] = max(MIN_HANDLE_SCALE, min(factors_left[array_index], MAX_HANDLE_SCALE))
+        factors_right[array_index] = max(MIN_HANDLE_SCALE, min(factors_right[array_index], MAX_HANDLE_SCALE))
+        
+    return factors_left, factors_right
+
 def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, frame_num, bone=None, parent_matrix=None, collector=None, obj_name=None):
     """Draw motion path handles with individual control points"""
     global _state
@@ -984,16 +1036,23 @@ def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, 
     handle_vector_left = mathutils.Vector((0.0, 0.0, 0.0))
     handle_vector_right = mathutils.Vector((0.0, 0.0, 0.0))
     
+    # Get correction factors
+    factors_left, factors_right = get_handle_correction_factors(keyframes_for_location)
+    
     # Calculate Local Handle Vectors from F-Curve
     for array_index in range(3):
         if array_index in keyframes_for_location:
             keyframe = keyframes_for_location[array_index]
             if hasattr(keyframe, 'handle_left') and hasattr(keyframe, 'handle_right'):
                 # Handle Vector = Handle Pos - Co
+                # Apply correction factor based on time duration
+                factor_l = factors_left.get(array_index, 1.0)
+                factor_r = factors_right.get(array_index, 1.0)
+                
                 # Left Handle (incoming)
-                diff_left = keyframe.handle_left[1] - keyframe.co[1]
+                diff_left = (keyframe.handle_left[1] - keyframe.co[1]) * factor_l
                 # Right Handle (outgoing)
-                diff_right = keyframe.handle_right[1] - keyframe.co[1]
+                diff_right = (keyframe.handle_right[1] - keyframe.co[1]) * factor_r
                 
                 if array_index == 0: 
                     handle_vector_left.x = diff_left
@@ -1879,6 +1938,9 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         
         self.convert_vector_handles_to_free(keyframes_for_location)
 
+        # Get correction factors
+        factors_left, factors_right = get_handle_correction_factors(keyframes_for_location)
+
         for array_index, keyframe in keyframes_for_location.items():
             original_left_type = keyframe.handle_left_type
             original_right_type = keyframe.handle_right_type
@@ -1888,31 +1950,16 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             if initial_val is None:
                 continue # Should not happen if captured correctly
             
-            initial_left = mathutils.Vector(initial_val) if side == 'left' else None
-            initial_right = mathutils.Vector(initial_val) if side == 'right' else None
-            
-            # If side matches, initial_val is the handle pos. If not, we don't use it directly?
-            # initial_handle_values stores the handle corresponding to 'side'
-            # Wait, capture_initial_handle_values stores based on 'side'.
-            # So _state.initial_handle_values[(frame, array_index)] IS the handle we are moving.
-            
             initial_pos_2d = mathutils.Vector(initial_val)
-            # initial_val is (x, y) tuple, but we only need the value for this axis (array_index).
-            # Wait, F-Curve handle is (frame, value).
-            # kp.handle_left is Vector((frame, value)).
-            # initial_handle_values stores (kp.handle_left[0], kp.handle_left[1]).
-            
-            # New Handle Pos = Initial Handle Pos + Offset
-            # But we only modify the Value (y), not Frame (x).
-            # Actually, we might modify Frame (x) if we wanted to change timing, but here we only do value?
-            # The offset is 3D (x,y,z).
-            # offset_local[array_index] corresponds to the change in VALUE for that channel.
             
             if side == 'left':
-                keyframe.handle_left[1] = initial_pos_2d[1] + total_offset_local_scaled[array_index]
-                # Optional: Handle time change (x) if we supported it, but usually we constrain to frame.
+                factor = factors_left.get(array_index, 1.0)
+                delta_val = total_offset_local_scaled[array_index] / factor
+                keyframe.handle_left[1] = initial_pos_2d[1] + delta_val
             else:
-                keyframe.handle_right[1] = initial_pos_2d[1] + total_offset_local_scaled[array_index]
+                factor = factors_right.get(array_index, 1.0)
+                delta_val = total_offset_local_scaled[array_index] / factor
+                keyframe.handle_right[1] = initial_pos_2d[1] + delta_val
             
             # Update opposite handle
             # For update_opposite_handle, we need a vector representing the CURRENT handle offset from Co.
@@ -2019,6 +2066,9 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         
         self.convert_vector_handles_to_free(keyframes_for_location)
         
+        # Get correction factors
+        factors_left, factors_right = get_handle_correction_factors(keyframes_for_location)
+        
         for array_index, keyframe in keyframes_for_location.items():
             original_left_type = keyframe.handle_left_type
             original_right_type = keyframe.handle_right_type
@@ -2038,11 +2088,15 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             if side == 'left':
                 if hasattr(keyframe, 'handle_left'):
                     keyframe.handle_left[0] = initial_pos_2d[0]
-                    keyframe.handle_left[1] = initial_pos_2d[1] + total_offset_local_scaled[array_index]
+                    factor = factors_left.get(array_index, 1.0)
+                    delta_val = total_offset_local_scaled[array_index] / factor
+                    keyframe.handle_left[1] = initial_pos_2d[1] + delta_val
             else:
                 if hasattr(keyframe, 'handle_right'):
                     keyframe.handle_right[0] = initial_pos_2d[0]
-                    keyframe.handle_right[1] = initial_pos_2d[1] + total_offset_local_scaled[array_index]
+                    factor = factors_right.get(array_index, 1.0)
+                    delta_val = total_offset_local_scaled[array_index] / factor
+                    keyframe.handle_right[1] = initial_pos_2d[1] + delta_val
             
             # Update opposite handle
             temp_handle_vector_local = mathutils.Vector((0.0, 0.0, 0.0))
@@ -2145,13 +2199,19 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             if not keyframes_for_location:
                 return None
             
+            # Get correction factors
+            factors_left, factors_right = get_handle_correction_factors(keyframes_for_location)
+            
             handle_vector_left = mathutils.Vector((0.0, 0.0, 0.0))
             handle_vector_right = mathutils.Vector((0.0, 0.0, 0.0))
             
             for array_index, keyframe in keyframes_for_location.items():
-                diff = keyframe.handle_left[1] - keyframe.co[1]
+                factor_l = factors_left.get(array_index, 1.0)
+                factor_r = factors_right.get(array_index, 1.0)
+                
+                diff = (keyframe.handle_left[1] - keyframe.co[1]) * factor_l
                 handle_vector_left[array_index] = diff
-                diff = keyframe.handle_right[1] - keyframe.co[1]
+                diff = (keyframe.handle_right[1] - keyframe.co[1]) * factor_r
                 handle_vector_right[array_index] = diff
             
             rotation_matrix = parent_matrix.to_3x3()
