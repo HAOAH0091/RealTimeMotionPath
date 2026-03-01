@@ -14,3 +14,12 @@ __pycache__/translations.cpython-313.pyc
 .trae/documents/fix_blank_area_deselect_plan.md
 .trae/documents/fix_pose_mode_blank_area_plan.md
 .trae/documents/motion_path_fix_plan.md
+__pycache__/config.cpython-311.pyc
+__pycache__/core.cpython-311.pyc
+__pycache__/drawing.cpython-311.pyc
+__pycache__/handlers.cpython-311.pyc
+__pycache__/operators.cpython-311.pyc
+__pycache__/preferences.cpython-311.pyc
+__pycache__/state.cpython-311.pyc
+__pycache__/ui.cpython-311.pyc
+__pycache__/utils.cpython-311.pyc

@@ -1,7 +1,7 @@
 bl_info = {
     "name" : "RealTimeMotionPath",
     "author" : "HAOAH",
-    "description" : "Real-time motion path display and manipulation in 3D viewport, supports direct handle editing and graph editor sync",
+    "description" : "在 3D 视口中显示和操作实时运动路径，支持直接手柄编辑和图形编辑器同步",
     "blender" : (5, 0, 0),
     "version" : (1, 0, 0),
     "location" : "3D Viewport › Header",
@@ -34,17 +34,17 @@ class MotionPathState:
         self.drag_start_item_pos = None
         self.selected_path_point = None
         self.selected_frame = None
-        self.selected_handle_side = None
-        self.selected_bone_name = None  # bone name string (safe, no direct RNA ref)
+ b          self.selected_handle_side = None
+        self.selected_bone_name = None  # 骨骼名称字符串（安全，无直接RNA引用）
         self.handle_points = []
         self.selected_handle_point = None
-        self.selected_handle_data = None  # Store handle data directly to avoid index errors
+        self.selected_handle_data = None  # 直接存储手柄数据以避免索引错误
         self.handle_dragging = False
-        self.selected_drag_object_name = None  # object name string (safe, no direct RNA ref)
-        self.position_cache = {}  # {obj_name: {cache_key: {frame: {'position': Vector}}}}
-        self.initial_handle_values = {}  # Store initial handle values for drag: {(frame, array_index): value}
+        self.selected_drag_object_name = None  # 对象名称字符串（安全，无直接RNA引用）
+        self.position_cache = {}  # {对象名: {缓存键: {帧: {'position': Vector}}}}
+        self.initial_handle_values = {}  # 存储拖动时的初始手柄值：{(frame, array_index): value}
         self.draw_handler = None
-        self.path_vertices = {}  # {(obj_name, bone_name_or_None): [Vector, ...]}
+        self.path_vertices = {}  # {(对象名, 骨骼名或None): [Vector, ...]}
         
     def reset(self):
         self.__init__()
@@ -56,7 +56,7 @@ def get_addon_prefs(context):
     return context.preferences.addons[__package__].preferences
 
 def _get_drag_obj(context):
-    """Safely resolve the drag-target object from its stored name. Never returns a stale RNA ref."""
+    """根据存储的名称安全地解析拖动目标对象。绝不返回过期的 RNA 引用。"""
     global _state
     if _state.selected_drag_object_name:
         try:
@@ -67,7 +67,7 @@ def _get_drag_obj(context):
             pass
     return context.active_object
 
-# Global lock to prevent recursion in smart update
+# 全局锁，防止智能更新中的递归
 _is_updating_cache = False
 
 
@@ -98,10 +98,11 @@ def get_billboard_basis(context):
         if not rv3d:
             return None, None
         view_rot = rv3d.view_rotation
+        
         right = view_rot @ mathutils.Vector((1, 0, 0))
         up = view_rot @ mathutils.Vector((0, 1, 0))
         
-        # Validate basis vectors
+        # 验证基向量
         if not all(math.isfinite(c) for c in right) or not all(math.isfinite(c) for c in up):
             return None, None
             
@@ -117,7 +118,7 @@ def get_pixel_scale(context, pos, pixel_size):
         return 0.0
         
     right = rv3d.view_rotation @ mathutils.Vector((1, 0, 0))
-    # Ensure pos is a Vector for math operations (it might be a tuple from safe drawing code)
+    # 确保 pos 是用于数学运算的 Vector（它可能是来自安全绘制代码的元组）
     offset_pos = mathutils.Vector(pos) + right * 0.001
     co2d_offset = view3d_utils.location_3d_to_region_2d(region, rv3d, offset_pos)
     
@@ -137,12 +138,12 @@ def get_pixel_scale(context, pos, pixel_size):
     return scale
 
 _circle_aa_shader = None
-CIRCLE_AA_FEATHER = 0.1  # soft-edge width for anti-aliased circle shader
-DEBUG_CIRCLE_DRAW = False  # set True to print exceptions in circle draw
+CIRCLE_AA_FEATHER = 0.1  # 抗锯齿圆形着色器的软边缘宽度
+DEBUG_CIRCLE_DRAW = False  # 设置为 True 以打印圆形绘制中的异常
 
 
 def _get_circle_aa_shader():
-    """Create or return cached anti-aliased circle shader (quad + smoothstep soft edge)."""
+    """创建或返回缓存的抗锯齿圆形着色器（四边形 + smoothstep 软边缘）。"""
     global _circle_aa_shader
     if _circle_aa_shader is None:
         vert_out = gpu.types.GPUStageInterfaceInfo("circle_aa_interface")
@@ -177,8 +178,8 @@ def _get_circle_aa_shader():
     return _circle_aa_shader
 
 def draw_billboard_circle(context, pos, radius_in_pixels, color, shader=None):
-    """Draw a circle using quad + custom shader for anti-aliased soft edge.
-    Note: shader arg is ignored (kept for API compatibility).
+    """使用四边形 + 自定义着色器绘制抗锯齿软边缘的圆形。
+    注意：shader 参数被忽略（为保持 API 兼容性而保留）。
     """
     try:
         px, py, pz = pos[0], pos[1], pos[2]
@@ -202,7 +203,7 @@ def draw_billboard_circle(context, pos, radius_in_pixels, color, shader=None):
     if scale == 0:
         return
 
-    # Quad corners: center ± right*scale ± up*scale, UV (0,0)-(1,1)
+    # 四边形角点：中心 ± right*scale ± up*scale, UV (0,0)-(1,1)
     c1 = (px - scale * rx - scale * ux, py - scale * ry - scale * uy, pz - scale * rz - scale * uz)
     c2 = (px + scale * rx - scale * ux, py + scale * ry - scale * uy, pz + scale * rz - scale * uz)
     c3 = (px + scale * rx + scale * ux, py + scale * ry + scale * uy, pz + scale * rz + scale * uz)
@@ -264,14 +265,14 @@ def draw_billboard_square(context, pos, half_size_in_pixels, color, shader):
         return
     
     try:
-        # Precompute vectors for corners (pure float)
-        # corner 1: right - up
+        # 预计算角点向量（纯浮点数）
+        # 角点 1: right - up
         c1x, c1y, c1z = rx - ux, ry - uy, rz - uz
-        # corner 2: right + up
+        # 角点 2: right + up
         c2x, c2y, c2z = rx + ux, ry + uy, rz + uz
-        # corner 3: -right + up
+        # 角点 3: -right + up
         c3x, c3y, c3z = -rx + ux, -ry + uy, -rz + uz
-        # corner 4: -right - up
+        # 角点 4: -right - up
         c4x, c4y, c4z = -rx - ux, -ry - uy, -rz - uz
         
         verts = (
@@ -295,8 +296,8 @@ def draw_billboard_square(context, pos, half_size_in_pixels, color, shader):
     batch.draw(shader)
 
 def draw_batched_billboard_circles(context, points, radius_in_pixels, color, shader=None, segments=8):
-    """Draw circles using quad + custom shader for anti-aliased soft edge.
-    Note: shader and segments args are ignored (kept for API compatibility).
+    """使用四边形 + 自定义着色器绘制抗锯齿软边缘的圆形。
+    注意：shader 和 segments 参数被忽略（为保持 API 兼容性而保留）。
     """
     if not points or radius_in_pixels <= 0:
         return
@@ -341,8 +342,8 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
         base = 0
         for pos in batch_points:
             try:
-                # Safer unpacking with explicit float conversion
-                # This detaches values from C-backed Vector objects to prevent Access Violations
+                # 使用显式浮点转换进行更安全的解包
+                # 这将值从 C 支持的 Vector 对象中分离，以防止访问冲突
                 px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
                 
                 if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz) and
@@ -372,7 +373,7 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
                 all_indices.extend(((base, base + 1, base + 2), (base, base + 2, base + 3)))
                 base += 4
             except Exception:
-                # Catch errors for individual points to protect the batch
+                # 捕获单个点的错误以保护批处理
                 continue
                 
         if not all_verts or not all_indices:
@@ -389,13 +390,13 @@ def draw_batched_billboard_circles(context, points, radius_in_pixels, color, sha
                 print(f"[MotionPathPro] Error drawing circles batch: {e}")
 
 def is_location_fcurve(fcurve, bone_name=None):
-    """Check if fcurve is a location fcurve for an object or a specific bone."""
+    """检查 fcurve 是否为对象或特定骨骼的位置 fcurve。"""
     if bone_name:
         return fcurve.data_path == f'pose.bones["{bone_name}"].location'
     return fcurve.data_path == 'location'
 
 def is_keyframe_at_frame(fcurves, frame_num, bone_name=None):
-    """Check if there's a keyframe at the given frame for location fcurves."""
+    """检查位置 fcurve 在给定帧处是否存在关键帧。"""
     for fcurve in fcurves:
         if is_location_fcurve(fcurve, bone_name):
             for keyframe in fcurve.keyframe_points:
@@ -405,27 +406,27 @@ def is_keyframe_at_frame(fcurves, frame_num, bone_name=None):
 
 def calculate_path_from_fcurves(obj, action, frames, bone_name=None):
     """
-    Calculate path points directly from fcurves, bypassing scene evaluation.
-    Returns: {frame: {'position': Vector((x,y,z))}}
+    直接从 fcurves 计算路径点，绕过场景评估。
+    返回：{frame: {'position': Vector((x,y,z))}}
     """
     path_data = {}
     
-    # Pre-fetch fcurves for location
+    # 预取位置的 fcurves
     fcurves = [fc for fc in get_fcurves(action) if is_location_fcurve(fc, bone_name)]
     
-    # Group by axis
+    # 按轴分组
     fcurves_by_axis = {}
     for fc in fcurves:
         fcurves_by_axis[fc.array_index] = fc
         
-    # Get default values if fcurve missing (from current object state)
-    # Note: This assumes defaults don't change over time (which is true if no fcurve)
+    # 如果缺少 fcurve，则获取默认值（来自当前对象状态）
+    # 注意：这假设默认值不会随时间变化（如果没有 fcurve，则为真）
     if bone_name:
         if bone_name in obj.pose.bones:
             defaults = obj.pose.bones[bone_name].location.copy()
         else:
             defaults = mathutils.Vector((0, 0, 0))
-        delta_loc = mathutils.Vector((0, 0, 0)) # Bones don't have delta location usually
+        delta_loc = mathutils.Vector((0, 0, 0)) # 骨骼通常没有增量位置
     else:
         defaults = obj.location.copy()
         delta_loc = obj.delta_location
@@ -436,7 +437,7 @@ def calculate_path_from_fcurves(obj, action, frames, bone_name=None):
             if axis in fcurves_by_axis:
                 pos[axis] = fcurves_by_axis[axis].evaluate(frame)
         
-        # Apply Delta Location
+        # 应用增量位置
         pos = pos + delta_loc
         
         path_data[frame] = {
@@ -447,44 +448,39 @@ def calculate_path_from_fcurves(obj, action, frames, bone_name=None):
 
 def build_position_cache(context):
     """
-    Build cache of 3D positions for keyframes and path line.
+    构建关键帧和路径线的 3D 位置缓存。
 
-    UNIFIED FAST PATH (all objects and all bones):
-      Always reads F-Curve values directly via fcurve.evaluate().
-      scene.frame_set() is NEVER called — the scene state is never modified.
-      This guarantees:
-        - No interaction lag (G/R/S transforms are never disrupted).
-        - Correct behaviour for rotation/scale constraints: the F-Curve-driven
-          location is unaffected by constraints that only change rotation or scale.
-          The corrected get_current_parent_matrix() ensures the displayed path is
-          drawn without constraint-rotation contamination.
-        - Bones with no location F-Curves (pure IK end-effectors, etc.) produce an
-          empty frame set and are silently skipped — correct, nothing to display.
+    统一快速路径（所有对象和所有骨骼）：
+      始终通过 fcurve.evaluate() 直接读取 F-Curve 值。
+      绝不调用 scene.frame_set() —— 场景状态从未被修改。
+      这保证了：
+        - 无交互延迟（G/R/S 变换从未中断）。
+        - 旋转/缩放约束的正确行为：F-Curve 驱动的位置不受仅更改旋转或缩放的约束的影响。
+          校正后的 get_current_parent_matrix() 确保绘制的路径没有约束旋转污染。
+        - 没有位置 F-Curve 的骨骼（纯 IK 末端执行器等）产生空帧集并被静默跳过 —— 正确，无需显示。
 
-    COORDINATE SPACE CONTRACT:
-      Object mode:
-        Cached positions are raw F-Curve location values (matrix_basis space):
-          - Unparented: equals world space.
-          - Parented:   equals matrix_basis space; converted to world at draw time via
-                        parent.matrix_world @ matrix_parent_inverse.
-        get_current_parent_matrix() returns Identity (unparented) or
-        obj.parent.matrix_world @ obj.matrix_parent_inverse (parented).
+    坐标空间契约：
+      对象模式：
+        缓存位置是原始 F-Curve 位置值（matrix_basis 空间）：
+          - 无父级：等于世界空间。
+          - 有父级：等于 matrix_basis 空间；在绘制时通过 parent.matrix_world @ matrix_parent_inverse 转换为世界空间。
+        get_current_parent_matrix() 返回 Identity（无父级）或
+        obj.parent.matrix_world @ obj.matrix_parent_inverse（有父级）。
 
-      Pose (bone) mode:
-        Cached positions are raw F-Curve location values in bone LOCAL space.
-        get_current_parent_matrix() returns:
-          obj.matrix_world @ parent.matrix @ parent.bone.matrix_local.inv() @ bone.matrix_local  (child bone)
-          obj.matrix_world @ bone.bone.matrix_local                                               (root bone)
-        This converts the bone-local F-Curve offset to world space without
-        incorporating the bone's own constraint effects.
+      姿态（骨骼）模式：
+        缓存位置是骨骼局部空间中的原始 F-Curve 位置值。
+        get_current_parent_matrix() 返回：
+          obj.matrix_world @ parent.matrix @ parent.bone.matrix_local.inv() @ bone.matrix_local  (子骨骼)
+          obj.matrix_world @ bone.bone.matrix_local                                               (根骨骼)
+        这将在不包含骨骼自身约束效果的情况下将骨骼局部 F-Curve 偏移转换为世界空间。
 
-    NOTE on Smart Interaction:
-      on_depsgraph_update skips this function when only OBJECT (not ACTION) changes,
-      reusing the existing cache so interactive transforms (G/R/S) feel smooth.
+    关于智能交互的说明：
+      当仅 OBJECT（非 ACTION）更改时，on_depsgraph_update 会跳过此函数，
+      重用现有缓存，以便交互式变换（G/R/S）感觉流畅。
     """
     global _state, _is_updating_cache
     
-    # Atomic Lock: Prevent recursive updates
+    # 原子锁：防止递归更新
     if _is_updating_cache:
         return
         
@@ -505,7 +501,7 @@ def build_position_cache(context):
         frames_range = range(frame_start, frame_end + 1)
         
         if obj and obj.mode == 'POSE':
-            # --- POSE MODE: single armature, all selected bones ---
+            # --- 姿态模式：单个骨架，所有选定骨骼 ---
             if not obj.animation_data or not obj.animation_data.action:
                 return
             action = obj.animation_data.action
@@ -532,7 +528,7 @@ def build_position_cache(context):
                 except Exception:
                     continue
         else:
-            # --- OBJECT MODE: all selected objects ---
+            # --- 对象模式：所有选定对象 ---
             objects_to_cache = list(context.selected_objects or [])
             if obj and obj not in objects_to_cache:
                 objects_to_cache.append(obj)
@@ -563,104 +559,100 @@ def build_position_cache(context):
 
 def get_current_parent_matrix(obj, bone=None):
     """
-    Unified calculation of the parent matrix (from cached-position space to world space).
+    统一计算父级矩阵（从缓存位置空间到世界空间）。
 
-    OBJECT mode:
-      F-Curve location values are in matrix_basis space (the raw location/rotation/scale
-      driven by keyframes). Blender's full world transform is:
+    对象模式：
+      F-Curve 位置值处于 matrix_basis 空间（由关键帧驱动的原始位置/旋转/缩放）。
+      Blender 的完整世界变换是：
           matrix_world = parent.matrix_world @ matrix_parent_inverse @ matrix_basis
-      So the correct parent matrix to apply to F-Curve values is:
-        - Unparented  → Identity  (F-Curve values ARE world positions)
-        - Parented    → obj.parent.matrix_world @ obj.matrix_parent_inverse
-      matrix_parent_inverse is stored at parenting time (it's the inverse of the parent's
-      world matrix at that moment) and ensures the child does not jump. Without it the
-      path appears at the parent's origin instead of the child's actual position.
-      This formula still avoids baking the object's own constraint effects (rotation,
-      scale) into the parent matrix, preventing paths from rotating when a rotation-only
-      constraint (e.g. Damped Track) is active.
+      因此，应用于 F-Curve 值的正确父级矩阵是：
+        - 无父级  → Identity  (F-Curve 值就是世界位置)
+        - 有父级    → obj.parent.matrix_world @ obj.matrix_parent_inverse
+      matrix_parent_inverse 在建立父子关系时存储（它是那一刻父级世界矩阵的逆矩阵），
+      并确保子级不会跳变。没有它，路径将出现在父级的原点而不是子级的实际位置。
+      该公式仍然避免将对象自身的约束效果（旋转、缩放）烘焙到父级矩阵中，
+      防止当仅旋转约束（例如阻尼跟踪）处于活动状态时路径发生旋转。
 
-    POSE (bone) mode:
-      Bone F-Curve location values are offsets in BONE LOCAL space. Converting to world:
+    姿态（骨骼）模式：
+      骨骼 F-Curve 位置值是骨骼局部空间中的偏移量。转换为世界空间：
 
-        Root bone:
+        根骨骼：
           armature_world @ bone.matrix_local @ [fx, fy, fz]
-          bone.matrix_local (armature space) converts bone-local offset to armature space.
+          bone.matrix_local (骨架空间) 将骨骼局部偏移转换为骨架空间。
 
-        Child bone:
+        子骨骼：
           armature_world @ parent.matrix @ parent.bone.matrix_local.inverted() @ bone.matrix_local @ [fx, fy, fz]
 
-          Step-by-step geometry:
-            bone.matrix_local              — child rest in armature space
-            parent.bone.matrix_local.inv() — "undo" parent rest, giving child rest in
-                                             parent-bone LOCAL space
-            parent.matrix                 — apply parent's CURRENT pose (armature space)
-          When parent has no animation: parent.matrix == parent.bone.matrix_local, so the
-          middle two terms cancel to Identity and the formula reduces to the root-bone case.
+          分步几何：
+            bone.matrix_local              — 骨架空间中的子级静止姿态
+            parent.bone.matrix_local.inv() — "撤销"父级静止姿态，给出父骨骼局部空间中的子级静止姿态
+            parent.matrix                 — 应用父级的当前姿态（骨架空间）
+          当父级没有动画时：parent.matrix == parent.bone.matrix_local，
+          因此中间两项抵消为 Identity，公式简化为根骨骼的情况。
 
-      bone.matrix_local is the REST-pose matrix — unaffected by this bone's constraints.
-      parent.matrix is the parent's CURRENT pose — correctly reflects animated parents
-      while excluding this bone's own constraint effects.
-      Also used for drag: parent_matrix.to_3x3().inverted() converts a world-space mouse
-      offset to bone-local F-Curve space for correct drag direction under constraints.
+      bone.matrix_local 是静止姿态矩阵 — 不受此骨骼约束的影响。
+      parent.matrix 是父级的当前姿态 — 正确反映动画父级，同时排除此骨骼自身的约束效果。
+      也用于拖动：parent_matrix.to_3x3().inverted() 将世界空间鼠标偏移转换为骨骼局部 F-Curve 空间，
+      以便在约束下获得正确的拖动方向。
     """
     try:
         if obj.mode == 'POSE' and bone:
-            # Bone Logic: use the parent chain to derive the space, NOT this bone's own
-            # post-constraint matrix (bone.matrix).  Using bone.matrix would bake this bone's
-            # rotation/scale constraints into the path, making it appear rotated/distorted.
+            # 骨骼逻辑：使用父级链来推导空间，而不是此骨骼自己的
+            # 约束后矩阵 (bone.matrix)。使用 bone.matrix 会将此骨骼的
+            # 旋转/缩放约束烘焙到路径中，使其看起来旋转/扭曲。
             #
-            # Correct formula for child bone:
+            # 子骨骼的正确公式：
             #   armature_world × parent_pose × parent_rest_inv × child_rest
             #
-            # bone.parent.matrix                   — parent's CURRENT pose in armature space
-            # bone.parent.bone.matrix_local.inv()  — converts armature space → parent-bone local
-            # bone.bone.matrix_local               — converts parent-bone local → armature space
-            #                                        (child rest position)
-            # Together the middle two terms are parent_rest_inv × child_rest, which is the
-            # child's rest matrix expressed in parent-bone local space.  When the parent has
-            # no animation (parent.matrix == parent.bone.matrix_local) they cancel to Identity.
+            # bone.parent.matrix                   — 骨架空间中父级的当前姿态
+            # bone.parent.bone.matrix_local.inv()  — 转换骨架空间 → 父骨骼局部
+            # bone.bone.matrix_local               — 转换父骨骼局部 → 骨架空间
+            #                                        (子级静止位置)
+            # 中间两项合起来是 parent_rest_inv × child_rest，即
+            # 在父骨骼局部空间中表示的子级静止矩阵。当父级
+            # 没有动画 (parent.matrix == parent.bone.matrix_local) 时，它们抵消为 Identity。
             if bone.parent:
-                # parent_to_child_rest: child's rest matrix expressed in parent-bone local space.
+                # parent_to_child_rest: 在父骨骼局部空间中表示的子级静止矩阵。
                 parent_to_child_rest = bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
                 return obj.matrix_world @ bone.parent.matrix @ parent_to_child_rest
             else:
-                # Root bone: armature world matrix × bone's rest matrix in armature space.
+                # 根骨骼：骨架世界矩阵 × 骨架空间中的骨骼静止矩阵。
                 return obj.matrix_world @ bone.bone.matrix_local
         else:
-            # Object Logic: parent.matrix_world @ matrix_parent_inverse converts F-Curve
-            # values (matrix_basis space) to world space without baking the object's own
-            # constraint effects.  Do NOT use matrix_world @ matrix_basis.inverted() —
-            # that formula breaks when a constraint changes rotation/scale, because
-            # matrix_world contains effects absent from matrix_basis.
+            # 对象逻辑：parent.matrix_world @ matrix_parent_inverse 将 F-Curve
+            # 值（matrix_basis 空间）转换为世界空间，而不烘焙对象自身的
+            # 约束效果。不要使用 matrix_world @ matrix_basis.inverted() —
+            # 当约束更改旋转/缩放时，该公式会失效，因为
+            # matrix_world 包含 matrix_basis 中不存在的效果。
             if obj.parent is None:
-                # Unparented: F-Curve values are already in world space.
+                # 无父级：F-Curve 值已在世界空间中。
                 return mathutils.Matrix.Identity(4)
             else:
                 parent_mat = obj.parent.matrix_world.copy()
-                # If parented to a specific bone, include that bone's current pose.
+                # 如果作为特定骨骼的子级，请包含该骨骼的当前姿态。
                 if obj.parent_type == 'BONE' and obj.parent_bone:
                     if obj.parent.pose and obj.parent_bone in obj.parent.pose.bones:
                         pb = obj.parent.pose.bones[obj.parent_bone]
                         parent_mat = obj.parent.matrix_world @ pb.matrix
-                    # Fallback: bone not found in pose (e.g. armature has no action);
-                    # treat as plain object parent — matrix_parent_inverse still applied below.
-                # matrix_parent_inverse compensates for the parent's position at the time
-                # of parenting, making F-Curve values map to the correct world positions.
+                    # 回退：姿态中未找到骨骼（例如骨架无动作）；
+                    # 视为普通对象父级 — 下面仍然应用 matrix_parent_inverse。
+                # matrix_parent_inverse 补偿建立父子关系时父级的位置，
+                # 使 F-Curve 值映射到正确的世界位置。
                 return parent_mat @ obj.matrix_parent_inverse
     except Exception:
-        # Catches Python-level RNA access errors (e.g. ReferenceError). Does NOT catch
-        # C++ EXCEPTION_ACCESS_VIOLATION; the primary fix is avoiding stale RNA refs in _state.
+        # 捕获 Python 级别的 RNA 访问错误（例如 ReferenceError）。不捕获
+        # C++ EXCEPTION_ACCESS_VIOLATION；主要修复方法是避免 _state 中的过期 RNA 引用。
         return mathutils.Matrix.Identity(4)
 
 class DrawCollector:
     def __init__(self):
-        self.lines = [] # flat list of vectors
-        self.line_colors = [] # flat list of colors
-        self.circles = {} # (radius, color) -> [pos]
+        self.lines = [] # 向量的扁平列表
+        self.line_colors = [] # 颜色的扁平列表
+        self.circles = {} # (半径, 颜色) -> [位置]
 
     def add_line(self, p1, p2, color):
         try:
-            # Validate points to prevent GPU driver crash
+            # 验证点以防止 GPU 驱动程序崩溃
             if not (math.isfinite(p1[0]) and math.isfinite(p1[1]) and math.isfinite(p1[2]) and
                     math.isfinite(p2[0]) and math.isfinite(p2[1]) and math.isfinite(p2[2])):
                 return
@@ -673,16 +665,16 @@ class DrawCollector:
         self.line_colors.append(color)
 
     def add_circle(self, pos, radius, color):
-        # Round radius and color to avoid too many batches due to float precision
+        # 对半径和颜色进行四舍五入，以避免因浮点精度而产生过多的批次
         r = round(radius, 2)
         
-        # Ensure color is RGBA (4 components)
+        # 确保颜色为 RGBA（4 个分量）
         if len(color) == 3:
             c_vals = (color[0], color[1], color[2], 1.0)
         elif len(color) >= 4:
             c_vals = (color[0], color[1], color[2], color[3])
         else:
-            c_vals = (1.0, 1.0, 1.0, 1.0) # Fallback
+            c_vals = (1.0, 1.0, 1.0, 1.0) # 回退
             
         c = tuple(round(x, 3) for x in c_vals)
         
@@ -692,7 +684,7 @@ class DrawCollector:
         self.circles[key].append(pos)
         
     def draw(self, context, styles):
-        # Draw Lines (POLYLINE_SMOOTH_COLOR for anti-aliasing)
+        # 绘制线条（POLYLINE_SMOOTH_COLOR 用于抗锯齿）
         if self.lines:
             try:
                 shader = gpu.shader.from_builtin('POLYLINE_SMOOTH_COLOR')
@@ -707,12 +699,12 @@ class DrawCollector:
             except Exception as e:
                 print(f"Error drawing lines batch: {e}")
             
-        # Draw Circles (POLYLINE for anti-aliasing)
+        # 绘制圆形（POLYLINE 用于抗锯齿）
         for (radius, color), points in self.circles.items():
             draw_batched_billboard_circles(context, points, radius, color, segments=8)
 
 def _build_ring_vertices(px, py, pz, scale, rx, ry, rz, ux, uy, uz, segments=32):
-    """Build a list of 3D vertex tuples forming a screen-aligned ring."""
+    """构建形成屏幕对齐环的 3D 顶点元组列表。"""
     verts = []
     for i in range(segments):
         angle = 2 * math.pi * i / segments
@@ -727,7 +719,7 @@ def _build_ring_vertices(px, py, pz, scale, rx, ry, rz, ux, uy, uz, segments=32)
 
 
 def draw_origin_indicator(context, obj, bone, styles):
-    """Draw an origin indicator for the active object/bone on top of the motion path."""
+    """在运动路径之上为活动对象/骨骼绘制原点指示器。"""
     try:
         if bone is not None:
             world_pos = (obj.matrix_world @ bone.matrix).translation
@@ -780,13 +772,13 @@ def draw_origin_indicator(context, obj, bone, styles):
 
 
 def draw_motion_path_overlay():
-    """Drawing advanced motion path overlays"""
-    # Dynamically get the context for the current draw call
-    # This is crucial when switching workspaces or areas
+    """绘制高级运动路径覆盖层"""
+    # 动态获取当前绘制调用的上下文
+    # 这在切换工作区或区域时至关重要
     context = bpy.context
 
     try:
-        # Safety check: Ensure we are in a 3D View context
+        # 安全检查：确保我们处于 3D 视图上下文中
         if not context.space_data or context.space_data.type != 'VIEW_3D':
              return
 
@@ -799,10 +791,10 @@ def draw_motion_path_overlay():
 
         styles = get_addon_prefs(context)
 
-        # Enable Alpha Blending for smoother edges
+        # 启用 Alpha 混合以获得更平滑的边缘
         gpu.state.blend_set('ALPHA')
 
-        # Draw continuous path lines for ALL cached targets (POLYLINE for anti-aliasing)
+        # 为所有缓存目标绘制连续路径线（POLYLINE 用于抗锯齿）
         if wm.custom_path_draw_active and _state.path_vertices:
             shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
             viewport_size = gpu.state.viewport_get()[2:]
@@ -848,7 +840,7 @@ def draw_motion_path_overlay():
         
         _state.handle_points = []
         
-        # Initialize Batch Collector
+        # 初始化批处理收集器
         collector = DrawCollector()
         
         if obj and obj.mode == 'POSE':
@@ -876,10 +868,10 @@ def draw_motion_path_overlay():
                 except Exception:
                     continue
              
-        # Submit Batches
+        # 提交批次
         collector.draw(context, styles)
 
-        # Draw origin indicator on top of motion path
+        # 在运动路径之上绘制原点指示器
         if obj and styles.show_origin_indicator:
             target_bone = None
             if obj.mode == 'POSE':
@@ -894,7 +886,7 @@ def draw_motion_path_overlay():
         traceback.print_exc()
 
 def draw_enhanced_path(context, obj, parent_matrix, collector, styles, bone=None, obj_name=None):
-    """Draw advanced motion path keyframe points and handles for an object or a pose bone."""
+    """绘制对象或姿态骨骼的高级运动路径关键帧点和手柄。"""
     global _state
     cache_key = bone.name if bone else None
     if obj_name is None:
@@ -936,10 +928,10 @@ def draw_motion_path_point(context, point_3d, frame_num,
                            is_keyframe_point, is_selected_keyframe,
                            keyframes_for_location, action,
                            shader, styles, bone=None, parent_matrix=None, collector=None, obj_name=None):
-    """Draw motion path points, with handles if needed"""
+    """绘制运动路径点，如果需要则带手柄"""
     global _state
     wm = context.window_manager
-    # styles passed as arg
+    # styles 作为参数传递
     
     if _state.is_dragging and frame_num == _state.selected_frame:
         color = styles.selected_keyframe_point_color
@@ -982,29 +974,29 @@ def draw_motion_path_point(context, point_3d, frame_num,
 
 def get_handle_correction_factors(keyframes_for_location):
     """
-    Calculate correction factors for handles based on time difference (dt).
-    Returns (factors_left, factors_right) where factor = S / dt.
-    S is the average time duration of all handles.
+    根据时间差 (dt) 计算手柄的校正因子。
+    返回 (factors_left, factors_right)，其中 factor = S / dt。
+    S 是所有手柄的平均持续时间。
     
-    Includes clamping to prevent numerical explosion when dt is extremely small 
-    (e.g., vertical handles), which can cause 3D view artifacts or crashes.
+    包括钳位以防止在 dt 极小（例如垂直手柄）时发生数值爆炸，
+    这可能会导致 3D 视图伪影或崩溃。
     """
     dt_values = []
     
-    # 1. Collect all valid dt values
+    # 1. 收集所有有效的 dt 值
     for array_index, keyframe in keyframes_for_location.items():
         dt_l = abs(keyframe.handle_left[0] - keyframe.co[0])
         dt_r = abs(keyframe.handle_right[0] - keyframe.co[0])
         if dt_l > 0.001: dt_values.append(dt_l)
         if dt_r > 0.001: dt_values.append(dt_r)
         
-    # 2. Calculate Reference Scale S
+    # 2. 计算参考比例 S
     if not dt_values:
         S = 1.0
     else:
         S = sum(dt_values) / len(dt_values)
         
-    # 3. Calculate Factors
+    # 3. 计算因子
     factors_left = {}
     factors_right = {}
     
@@ -1015,21 +1007,21 @@ def get_handle_correction_factors(keyframes_for_location):
         factors_left[array_index] = S / dt_l if dt_l > 0.001 else 1.0
         factors_right[array_index] = S / dt_r if dt_r > 0.001 else 1.0
         
-        # Clamp factors to prevent explosion (e.g. if dt is very small but > 0.001)
+        # 钳位因子以防止爆炸（例如，如果 dt 非常小但 > 0.001）
         factors_left[array_index] = max(MIN_HANDLE_SCALE, min(factors_left[array_index], MAX_HANDLE_SCALE))
         factors_right[array_index] = max(MIN_HANDLE_SCALE, min(factors_right[array_index], MAX_HANDLE_SCALE))
         
     return factors_left, factors_right
 
 def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, styles, frame_num, bone=None, parent_matrix=None, collector=None, obj_name=None):
-    """Draw motion path handles with individual control points"""
+    """绘制带有单独控制点的运动路径手柄"""
     global _state
     wm = context.window_manager
-    # styles passed as arg
+    # styles 作为参数传递
     global_scale = wm.global_handle_visual_scale
     
-    # NOTE: point_3d is already in World Space (transformed in caller)
-    # parent_matrix is the current frame's parent matrix
+    # 注意：point_3d 已经在世界空间中（在调用者中转换）
+    # parent_matrix 是当前帧的父级矩阵
     
     if parent_matrix is None:
         parent_matrix = mathutils.Matrix.Identity(4)
@@ -1039,22 +1031,22 @@ def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, 
     handle_vector_left = mathutils.Vector((0.0, 0.0, 0.0))
     handle_vector_right = mathutils.Vector((0.0, 0.0, 0.0))
     
-    # Get correction factors
+    # 获取校正因子
     factors_left, factors_right = get_handle_correction_factors(keyframes_for_location)
     
-    # Calculate Local Handle Vectors from F-Curve
+    # 从 F-Curve 计算局部手柄向量
     for array_index in range(3):
         if array_index in keyframes_for_location:
             keyframe = keyframes_for_location[array_index]
             if hasattr(keyframe, 'handle_left') and hasattr(keyframe, 'handle_right'):
-                # Handle Vector = Handle Pos - Co
-                # Apply correction factor based on time duration
+                # 手柄向量 = 手柄位置 - Co
+                # 根据持续时间应用校正因子
                 factor_l = factors_left.get(array_index, 1.0)
                 factor_r = factors_right.get(array_index, 1.0)
                 
-                # Left Handle (incoming)
+                # 左手柄（传入）
                 diff_left = (keyframe.handle_left[1] - keyframe.co[1]) * factor_l
-                # Right Handle (outgoing)
+                # 右手柄（传出）
                 diff_right = (keyframe.handle_right[1] - keyframe.co[1]) * factor_r
                 
                 if array_index == 0: 
@@ -1067,12 +1059,12 @@ def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, 
                     handle_vector_left.z = diff_left
                     handle_vector_right.z = diff_right
     
-    # Transform to World Space
-    # We use rotation_matrix @ vector because vectors are directions, not points
+    # 转换为世界空间
+    # 我们使用 rotation_matrix @ vector，因为向量是方向，而不是点
     world_vector_left = rotation_matrix @ handle_vector_left
     world_vector_right = rotation_matrix @ handle_vector_right
     
-    # Draw Left Handle
+    # 绘制左手柄
     handle_left_pos = point_3d + (world_vector_left * global_scale)
     _state.handle_points.append({
         'position': handle_left_pos,
@@ -1088,7 +1080,7 @@ def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, 
     if collector:
         collector.add_line(point_3d, handle_left_pos, line_color)
 
-    # Draw Right Handle
+    # 绘制右手柄
     handle_right_pos = point_3d + (world_vector_right * global_scale)
     _state.handle_points.append({
         'position': handle_right_pos,
@@ -1104,9 +1096,9 @@ def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, 
     if collector:
         collector.add_line(point_3d, handle_right_pos, line_color)
     
-    # Draw Endpoints
-    # Re-implementing the square drawing loop correctly
-    # We always add 2 handles now (Left and Right).
+    # 绘制端点
+    # 正确地重新实现正方形绘制循环
+    # 我们现在总是添加 2 个手柄（左和右）。
     num_added = 2
     
     if num_added > 0:
@@ -1134,16 +1126,16 @@ def draw_motion_path_handles(context, point_3d, keyframes_for_location, shader, 
                 collector.add_circle(point['position'], styles.handle_endpoint_size / 2, color)
 
 def enable_draw_handler(context):
-    """Enable draw handler"""
+    """启用绘制处理程序"""
     global _state
     if _state.draw_handler is None:
-        # Pass empty tuple as args, so we don't bind to a stale context.
-        # The callback function must then handle context retrieval itself.
+        # 传递空元组作为参数，这样我们就不会绑定到过期的上下文。
+        # 回调函数必须自行处理上下文检索。
         _state.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_motion_path_overlay, (), 'WINDOW', 'POST_VIEW')
 
 def disable_draw_handler():
-    """Disable custom drawing"""
+    """禁用自定义绘制"""
     global _state
     if _state.draw_handler is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_state.draw_handler, 'WINDOW')
@@ -1151,17 +1143,17 @@ def disable_draw_handler():
 
 @persistent
 def on_depsgraph_update(scene, depsgraph):
-    """Smart update handler for motion paths"""
+    """运动路径的智能更新处理程序"""
     global _state, _is_updating_cache
     
-    # 1. Check Recursion Lock (Fast Path)
-    # We still check here to avoid overhead of function call,
-    # even though build_position_cache handles it too.
+    # 1. 检查递归锁（快速路径）
+    # 我们仍然在这里检查以避免函数调用的开销，
+    # 即使 build_position_cache 也处理它。
     if _is_updating_cache:
         return
 
-    # 2. Check Dragging State (Conflict Resolution)
-    # If operator is handling it, we do nothing.
+    # 2. 检查拖动状态（冲突解决）
+    # 如果操作员正在处理它，我们什么也不做。
     if _state.is_dragging or _state.handle_dragging:
         return
 
@@ -1169,13 +1161,13 @@ def on_depsgraph_update(scene, depsgraph):
     if not wm.custom_path_draw_active or wm.motion_path_update_mode != 'SMART':
         return
 
-    # Check if we need to update
-    # We care about Object transforms and Action data
+    # 检查我们是否需要更新
+    # 我们关心对象变换和动作数据
     is_object_updated = depsgraph.id_type_updated('OBJECT')
     is_action_updated = depsgraph.id_type_updated('ACTION')
     
     if is_object_updated or is_action_updated:
-        # Check if animation is playing to avoid heavy load during playback
+        # 检查动画是否正在播放以避免播放期间负载过重
         if bpy.context.screen and bpy.context.screen.is_animation_playing:
             return
 
@@ -1197,7 +1189,7 @@ def on_depsgraph_update(scene, depsgraph):
             print(f"Error in smart update: {e}")
 
 class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
-    """Auto update motion paths when change keyframes"""
+    """更改关键帧时自动更新运动路径"""
     bl_idname = "motion_path.auto_update_motion_paths"
     bl_label = "Auto Update Motion Paths"
     bl_description = "Real time update motion paths"
@@ -1219,14 +1211,14 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         self._last_bone_selection = self._get_bone_selection_state(context)
         self._needs_update = False
         
-        # Register Smart Handler
+        # 注册智能处理程序
         if on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
             bpy.app.handlers.depsgraph_update_post.append(on_depsgraph_update)
             
-        # Setup Timer for Timer Mode
-        # We always create a timer to handle mode switching dynamically, 
-        # but we only act on it if in TIMER mode.
-        # Use auto_update_fps to calculate interval
+        # 为计时器模式设置计时器
+        # 我们总是创建一个计时器来动态处理模式切换，
+        # 但我们只在计时器模式下执行它。
+        # 使用 auto_update_fps 计算间隔
         interval = 1.0 / max(1, wm.auto_update_fps)
         self._timer = wm.event_timer_add(interval, window=context.window)
         
@@ -1236,7 +1228,7 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
     def modal(self, context, event):
         wm = context.window_manager
 
-        # Detect active object switch
+        # 检测活动对象切换
         active_obj = context.active_object
         current_obj_name = active_obj.name if active_obj else None
         if current_obj_name != self._last_active_obj_name:
@@ -1252,28 +1244,28 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
             _state.selected_drag_object_name = None
             self._needs_update = True
 
-        # Detect selected objects change (Object mode)
+        # 检测选定对象的更改（对象模式）
         current_selected = self._get_selected_obj_names(context)
         if current_selected != self._last_selected_obj_names:
             self._last_selected_obj_names = current_selected
             self._needs_update = True
 
-        # Check bone selection changes (Pose mode)
+        # 检查骨骼选择更改（姿态模式）
         current_bone_selection = self._get_bone_selection_state(context)
         if current_bone_selection != self._last_bone_selection:
             self._last_bone_selection = current_bone_selection
             if current_bone_selection is None:
-                _state.selected_bone_name = None  # Clear when switching out of Pose mode
+                _state.selected_bone_name = None  # 退出姿态模式时清除
             self._needs_update = True
         
-        # TIMER Mode Logic
+        # 计时器模式逻辑
         if wm.motion_path_update_mode == 'TIMER' and event.type == 'TIMER':
             current_values = self._get_keyframe_values(context)
             if current_values != self._last_keyframe_values:
                 self._needs_update = True
                 self._last_keyframe_values = current_values
                 
-        # Handle Updates
+        # 处理更新
         if self._needs_update:
             try:
                 build_position_cache(context)
@@ -1297,7 +1289,7 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
             wm.event_timer_remove(self._timer)
             self._timer = None
             
-        # Remove Smart Handler
+        # 移除智能处理程序
         if on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
             bpy.app.handlers.depsgraph_update_post.remove(on_depsgraph_update)
     
@@ -1341,11 +1333,11 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         return tuple(all_values) if all_values else None
     
     def _get_selected_obj_names(self, context):
-        """Get sorted tuple of selected object names for change detection."""
+        """获取选定对象名称的排序元组以进行更改检测。"""
         return tuple(sorted(obj.name for obj in context.selected_objects)) if context.selected_objects else ()
     
     def _get_bone_selection_state(self, context):
-        """Get current bone selection state"""
+        """获取当前骨骼选择状态"""
         active_object = context.active_object
         if not active_object or active_object.mode != 'POSE':
             return None
@@ -1356,7 +1348,7 @@ class MOTIONPATH_AutoUpdateMotionPaths(bpy.types.Operator):
         return (active_bone_name, selected_bone_names)
     
 class MOTIONPATH_SetHandleType(bpy.types.Operator):
-    """Set handle type for selected keyframes"""
+    """为选定的关键帧设置手柄类型"""
     bl_idname = "motion_path.set_handle_type"
     bl_label = "Set Handle Type"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1374,7 +1366,7 @@ class MOTIONPATH_SetHandleType(bpy.types.Operator):
 
 
 class MOTIONPATH_DirectManipulationToggle(bpy.types.Operator):
-    """Enable/Disable Motion Path Editing"""
+    """启用/禁用运动路径编辑"""
     bl_idname = "motion_path.direct_manipulation_toggle"
     bl_label = "Toggle Direct Manipulation"
     bl_description = "Enable/Disable Motion Path Editing"
@@ -1400,20 +1392,20 @@ class MOTIONPATH_DirectManipulationToggle(bpy.types.Operator):
 
 def find_region_under_mouse(context, event):
     """
-    Manually find the 3D View region under the mouse.
-    This is required because 'context' in modal operators can be stale when switching workspaces.
-    Returns: (region, space_data, local_mouse_pos, area) or (None, None, None, None)
+    手动查找鼠标下的 3D 视图区域。
+    这是必需的，因为在切换工作区时，模态运算符中的 'context' 可能会过期。
+    返回：(region, space_data, local_mouse_pos, area) 或 (None, None, None, None)
     """
     mouse_x = event.mouse_x
     mouse_y = event.mouse_y
 
-    # Support multi-window setups
-    # Blender events are typically relative to the active window
-    # We iterate over all windows to be safe
+    # 支持多窗口设置
+    # Blender 事件通常相对于活动窗口
+    # 我们遍历所有窗口以确保安全
     
-    # Try current context window first
+    # 首先尝试当前上下文窗口
     windows_to_check = [context.window] if context.window else []
-    # Then others
+    # 然后是其他窗口
     for win in context.window_manager.windows:
         if win not in windows_to_check:
             windows_to_check.append(win)
@@ -1422,24 +1414,24 @@ def find_region_under_mouse(context, event):
         screen = window.screen
         if not screen: continue
         
-        # Check all areas in this screen
+        # 检查此屏幕中的所有区域
         for area in screen.areas:
-            # We only care about 3D Views
+            # 我们只关心 3D 视图
             if area.type != 'VIEW_3D':
                 continue
                 
-            # Area bounds check (relative to window)
+            # 区域边界检查（相对于窗口）
             if (area.x <= mouse_x < area.x + area.width and
                 area.y <= mouse_y < area.y + area.height):
                 
-                # Check regions within area
+                # 检查区域内的区域
                 for region in area.regions:
-                    if region.type == 'WINDOW': # The main viewport area
-                        # Region bounds check
+                    if region.type == 'WINDOW': # 主视口区域
+                        # 区域边界检查
                         if (region.x <= mouse_x < region.x + region.width and
                             region.y <= mouse_y < region.y + region.height):
                             
-                            # Found the specific region under mouse
+                            # 找到鼠标下的特定区域
                             local_x = mouse_x - region.x
                             local_y = mouse_y - region.y
                             space_data = area.spaces.active
@@ -1448,7 +1440,7 @@ def find_region_under_mouse(context, event):
     return None, None, None, None
 
 class MOTIONPATH_DirectManipulation(bpy.types.Operator):
-    """Directly manipulate points on motion paths"""
+    """直接操作运动路径上的点"""
     bl_idname = "motion_path.direct_manipulation"
     bl_label = "Direct Motion Path Manipulation"
     bl_options = {'REGISTER', 'UNDO'}
@@ -1469,7 +1461,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         self._last_draw_time = 0.0
     
     def convert_vector_handles_to_free(self, keyframes_for_location):
-        """Convert vector handles to free handles to allow editing"""
+        """将矢量手柄转换为自由手柄以允许编辑"""
         for array_index, keyframe in keyframes_for_location.items():
             if (keyframe.handle_left_type == 'VECTOR' and 
                 keyframe.handle_right_type == 'VECTOR'):
@@ -1488,32 +1480,32 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
     def modal(self, context, event):
         global _state
         
-        # Override context with current global context to ensure we get the region under the mouse
-        # This fixes issues when switching workspaces or areas
+        # 使用当前全局上下文覆盖上下文，以确保我们获取鼠标下的区域
+        # 这修复了切换工作区或区域时的问题
         context = bpy.context
 
         wm = context.window_manager
         if not wm.direct_manipulation_active or not self._is_active:
             return self.cancel(context)
         
-        # REMOVED: Hardcoded block for Armature Object Mode
-        # We now rely on hit-testing below to decide whether to intercept or pass through.
-        # This fixes the issue where Armature objects could not have their motion paths edited in Object Mode.
+        # 已移除：骨架对象模式的硬编码块
+        # 我们现在依靠下面的命中测试来决定是拦截还是通过。
+        # 这修复了骨架对象无法在对象模式下编辑其运动路径的问题。
         
         if event.type == 'MOUSEMOVE':
             self._mouse_pos = (event.mouse_region_x, event.mouse_region_y)
             
-            # FPS Limiting
+            # FPS 限制
             target_interval = 1.0 / max(1, wm.motion_path_fps_limit)
             current_time = time.time()
             if (current_time - self._last_draw_time) < target_interval:
                 return {'PASS_THROUGH'}
             self._last_draw_time = current_time
             
-            # Use manual region finding to ensure we are interacting with the correct 3D View
+            # 使用手动区域查找以确保我们正在与正确的 3D 视图交互
             region, space_data, local_mouse_pos, target_area = find_region_under_mouse(context, event)
             if not region or not space_data:
-                # Mouse is not over a 3D View, pass through event
+                # 鼠标不在 3D 视图上方，传递事件
                 return {'PASS_THROUGH'}
 
             rv3d = space_data.region_3d
@@ -1523,12 +1515,12 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 new_3d_pos = view3d_utils.region_2d_to_location_3d(region, rv3d, mouse_coord, _state.drag_start_3d)
 
                 if _state.selected_handle_side is None:
-                    # Point dragging: incremental delta — anchor updated each frame so depth projection stays correct.
+                    # 点拖动：增量 delta — 每一帧更新锚点，以便深度投影保持正确。
                     offset = new_3d_pos - _state.drag_start_3d
                     self.move_selected_points(context, offset)
                     _state.drag_start_3d = new_3d_pos
                 else:
-                    # Handle dragging: total offset from the original drag-start so handles don't drift.
+                    # 手柄拖动：与原始拖动起点的总偏移量，因此手柄不会漂移。
                     total_offset = new_3d_pos - _state.drag_start_3d
                     self.move_selected_handles(context, total_offset, _state.selected_handle_side)
 
@@ -1544,11 +1536,11 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             elif _state.handle_dragging and _state.selected_handle_point is not None:
                 mouse_coord = mathutils.Vector(local_mouse_pos)
                 
-                # Use drag_start_3d as depth reference for consistent projection
+                # 使用 drag_start_3d 作为深度参考以实现一致的投影
                 new_3d_pos = view3d_utils.region_2d_to_location_3d(region, rv3d, mouse_coord, _state.drag_start_3d)
                 total_offset = new_3d_pos - _state.drag_start_3d
                 
-                # Use cached handle data if available to avoid IndexError when handle_points changes
+                # 如果可用，使用缓存的手柄数据以避免当 handle_points 更改时出现 IndexError
                 if _state.selected_handle_data:
                     handle_point = _state.selected_handle_data
                     self.move_handle_point(context, total_offset, handle_point)
@@ -1556,7 +1548,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     handle_point = _state.handle_points[_state.selected_handle_point]
                     self.move_handle_point(context, total_offset, handle_point)
                 
-                # Update path line in real-time
+                # 实时更新路径线
                 try:
                     build_position_cache(context)
                 except Exception:
@@ -1570,7 +1562,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         
         elif event.type == 'RIGHTMOUSE':
             if event.value == 'PRESS':
-                # Use manual region finding
+                # 使用手动区域查找
                 region, space_data, local_mouse_pos, target_area = find_region_under_mouse(context, event)
                 if not region or not space_data:
                     return {'PASS_THROUGH'}
@@ -1617,7 +1609,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
 
         elif event.type == 'LEFTMOUSE':
             if event.value == 'PRESS':
-                # Use manual region finding
+                # 使用手动区域查找
                 region, space_data, local_mouse_pos, target_area = find_region_under_mouse(context, event)
                 if not region or not space_data:
                     return {'PASS_THROUGH'}
@@ -1822,8 +1814,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 context.area.tag_redraw()
             return {'PASS_THROUGH'}
         
-        # Explicitly pass through all other events (G, R, S, etc.)
-        # This ensures we don't block standard Blender tools when not interacting with the path
+        # 显式传递所有其他事件（G、R、S 等）
+        # 这确保了在不与路径交互时我们不会阻止标准 Blender 工具
         return {'PASS_THROUGH'}
     
     def invoke(self, context, event):
@@ -1868,12 +1860,12 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         bone_name = _state.selected_bone_name if (obj and obj.mode == 'POSE') else None
         bone = (obj.pose.bones.get(bone_name) if (bone_name and obj.mode == 'POSE' and obj.pose) else None)
         
-        # Calculate parent matrix inverse to transform World Offset -> Local Offset (Parent Space)
+        # 计算父级矩阵逆矩阵以转换 世界偏移 -> 局部偏移（父级空间）
         parent_matrix = get_current_parent_matrix(obj, bone)
-        # We only care about rotation/scale for the offset vector
+        # 我们只关心偏移向量的旋转/缩放
         parent_rot_inv = parent_matrix.to_3x3().inverted()
         
-        # Transform offset to Local Space (Parent Space)
+        # 将偏移转换为局部空间（父级空间）
         bone_local_offset = parent_rot_inv @ offset
         
         selected_frames = set()
@@ -1921,12 +1913,12 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         bone_name = _state.selected_bone_name if (obj and obj.mode == 'POSE') else None
         bone = (obj.pose.bones.get(bone_name) if (bone_name and obj.mode == 'POSE' and obj.pose) else None)
         
-        # Use helper to get current parent matrix
+        # 使用助手获取当前父级矩阵
         parent_matrix = get_current_parent_matrix(obj, bone)
         rotation_matrix = parent_matrix.to_3x3()
         
-        # Convert total offset to local space
-        # Total Offset Local = Inverse(ParentRot) * Total Offset World
+        # 将总偏移量转换为局部空间
+        # 总偏移量局部 = Inverse(ParentRot) * 总偏移量世界
         total_offset_local = rotation_matrix.inverted() @ total_offset_world
         total_offset_local_scaled = total_offset_local / global_scale
 
@@ -1941,17 +1933,17 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         
         self.convert_vector_handles_to_free(keyframes_for_location)
 
-        # Get correction factors
+        # 获取校正因子
         factors_left, factors_right = get_handle_correction_factors(keyframes_for_location)
 
         for array_index, keyframe in keyframes_for_location.items():
             original_left_type = keyframe.handle_left_type
             original_right_type = keyframe.handle_right_type
             
-            # Retrieve initial handle value
+            # 检索初始手柄值
             initial_val = _state.initial_handle_values.get((frame, array_index))
             if initial_val is None:
-                continue # Should not happen if captured correctly
+                continue # 如果正确捕获，不应发生这种情况
             
             initial_pos_2d = mathutils.Vector(initial_val)
             
@@ -1964,8 +1956,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 delta_val = total_offset_local_scaled[array_index] / factor
                 keyframe.handle_right[1] = initial_pos_2d[1] + delta_val
             
-            # Update opposite handle
-            # For update_opposite_handle, we need a vector representing the CURRENT handle offset from Co.
+            # 更新对手柄
+            # 对于 update_opposite_handle，我们需要一个表示当前手柄从 Co 的偏移量的向量。
             temp_handle_vector_local = mathutils.Vector((0.0, 0.0, 0.0))
             if side == 'left':
                 temp_handle_vector_local[array_index] = keyframe.co[1] - keyframe.handle_left[1]
@@ -1982,7 +1974,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 fcurve.update()
     
     def update_opposite_handle(self, keyframe, moved_handle_side, handle_vector_local, array_index):
-        """Update the opposite handle based on the moved handle and handle type"""
+        """根据移动的手柄和手柄类型更新对手柄"""
         if keyframe.handle_left_type == 'FREE' and keyframe.handle_right_type == 'FREE':
             return
         
@@ -1996,8 +1988,8 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         if (keyframe.handle_left_type in {'ALIGNED', 'AUTO', 'AUTO_CLAMPED'} or 
             keyframe.handle_right_type in {'ALIGNED', 'AUTO', 'AUTO_CLAMPED'}):
             
-            # Use Slope Projection (Fixed X) instead of Length Preservation
-            # This ensures the handle in Graph Editor only moves vertically, matching the active handle behavior.
+            # 使用斜率投影（固定 X）而不是长度保持
+            # 这确保图形编辑器中的手柄仅垂直移动，与活动手柄行为匹配。
             
             co = mathutils.Vector(keyframe.co)
             
@@ -2010,21 +2002,21 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 handle_opposite = mathutils.Vector(keyframe.handle_left)
                 target_handle_attr = 'handle_left'
             
-            # Calculate slope of the active handle
+            # 计算活动手柄的斜率
             dx_active = handle_active.x - co.x
             dy_active = handle_active.y - co.y
             
             if abs(dx_active) < 0.0001:
-                # Active handle is vertical (unlikely in F-Curve), skip to avoid division by zero
+                # 活动手柄是垂直的（在 F-Curve 中不太可能），跳过以避免除以零
                 return
 
             slope = dy_active / dx_active
             
-            # Apply slope to opposite handle, preserving its X offset
+            # 将斜率应用于对手柄，保持其 X 偏移
             dx_opposite = handle_opposite.x - co.x
             new_y_opposite = co.y + (slope * dx_opposite)
             
-            # Update only the Y component of the opposite handle
+            # 仅更新对手柄的 Y 分量
             if target_handle_attr == 'handle_right':
                 keyframe.handle_right[1] = new_y_opposite
             else:
@@ -2033,7 +2025,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             return
     
     def move_handle_point(self, context, total_offset_world, handle_point):
-        """Move a handle control point using total offset from initial position"""
+        """使用距初始位置的总偏移量移动手柄控制点"""
         if not all(math.isfinite(c) and abs(c) < SAFE_LIMIT for c in total_offset_world):
             return
 
@@ -2050,11 +2042,11 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         bone = (obj.pose.bones.get(bone_name) if (bone_name and obj.mode == 'POSE' and obj.pose) else None)
         global_scale = context.window_manager.global_handle_visual_scale
         
-        # Use helper
+        # 使用助手
         parent_matrix = get_current_parent_matrix(obj, bone)
         rotation_matrix = parent_matrix.to_3x3()
         
-        # Convert total offset to local space
+        # 将总偏移量转换为局部空间
         total_offset_local = rotation_matrix.inverted() @ total_offset_world
         total_offset_local_scaled = total_offset_local / global_scale
         
@@ -2069,7 +2061,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         
         self.convert_vector_handles_to_free(keyframes_for_location)
         
-        # Get correction factors
+        # 获取校正因子
         factors_left, factors_right = get_handle_correction_factors(keyframes_for_location)
         
         for array_index, keyframe in keyframes_for_location.items():
@@ -2080,14 +2072,14 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 keyframe.handle_left_type = 'ALIGNED'
                 keyframe.handle_right_type = 'ALIGNED'
             
-            # Retrieve initial handle value
+            # 检索初始手柄值
             initial_val = _state.initial_handle_values.get((frame, array_index))
             if initial_val is None:
                 continue
             
             initial_pos_2d = mathutils.Vector(initial_val)
             
-            # Apply offset to initial value
+            # 将偏移应用于初始值
             if side == 'left':
                 if hasattr(keyframe, 'handle_left'):
                     keyframe.handle_left[0] = initial_pos_2d[0]
@@ -2101,7 +2093,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                     delta_val = total_offset_local_scaled[array_index] / factor
                     keyframe.handle_right[1] = initial_pos_2d[1] + delta_val
             
-            # Update opposite handle
+            # 更新对手柄
             temp_handle_vector_local = mathutils.Vector((0.0, 0.0, 0.0))
             if side == 'left':
                 temp_handle_vector_local[array_index] = keyframe.co[1] - keyframe.handle_left[1]
@@ -2120,7 +2112,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 fcurve.update()
     
     def get_keyframe_position_for_handle(self, context, handle_point):
-        """Helper function to get the 3D position of the keyframe associated with a handle point."""
+        """获取与手柄点关联的关键帧的 3D 位置的辅助函数。"""
         global _state
         obj = _get_drag_obj(context)
         frame = handle_point['frame']
@@ -2139,7 +2131,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         return mathutils.Vector((0, 0, 0))
     
     def capture_initial_handle_values(self, context, frame_num, selected_bone_name, handle_side):
-        """Capture initial handle values at the start of drag."""
+        """在拖动开始时捕获初始手柄值。"""
         global _state
         _state.initial_handle_values = {}
         
@@ -2150,7 +2142,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         action = obj.animation_data.action
         fcurves = get_fcurves(action)
         
-        # Filter fcurves for location
+        # 过滤位置的 fcurves
         keyframes_for_location = {}
         for i, fcurve in enumerate(fcurves):
             if is_location_fcurve(fcurve, selected_bone_name):
@@ -2170,7 +2162,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
                 _state.initial_handle_values[(frame_num, array_index)] = (kp.handle_right[0], kp.handle_right[1])
 
     def get_motion_path_handle_at_mouse(self, context, event, region=None, rv3d=None, local_mouse_pos=None):
-        """Check if the mouse is over a handle end on the motion path"""
+        """检查鼠标是否在运动路径上的手柄末端上方"""
         if not region or not rv3d:
             if not context.space_data or context.space_data.type != 'VIEW_3D':
                  return None, None, None, None, None
@@ -2202,7 +2194,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
             if not keyframes_for_location:
                 return None
             
-            # Get correction factors
+            # 获取校正因子
             factors_left, factors_right = get_handle_correction_factors(keyframes_for_location)
             
             handle_vector_left = mathutils.Vector((0.0, 0.0, 0.0))
@@ -2285,7 +2277,7 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         return None, None, None, None, None
     
     def get_motion_path_point_at_mouse(self, context, event, region=None, rv3d=None, local_mouse_pos=None):
-        """Check if the mouse is over a motion path point"""
+        """检查鼠标是否在运动路径点上方"""
         if not region or not rv3d:
             if not context.space_data or context.space_data.type != 'VIEW_3D':
                 return None, None, None
@@ -2342,10 +2334,10 @@ class MOTIONPATH_DirectManipulation(bpy.types.Operator):
         return None, None, None
 
 def get_handle_point_at_mouse(context, event, region=None, rv3d=None, local_mouse_pos=None):
-    """Check if the mouse is over a handle control point"""
+    """检查鼠标是否在手柄控制点上方"""
     global _state
     
-    # Safety check: Ensure we are in a 3D View context if no region/rv3d provided
+    # 安全检查：如果未提供 region/rv3d，确保我们处于 3D 视图上下文中
     if not region or not rv3d:
         if not context.space_data or context.space_data.type != 'VIEW_3D':
             return None, None
@@ -2364,15 +2356,15 @@ def get_handle_point_at_mouse(context, event, region=None, rv3d=None, local_mous
     return None, None
 
 def is_keyframe_selected(action, bone_name, frame):
-    """Check if the keyframe at the specified frame is selected.
+    """检查指定帧处的关键帧是否被选中。
     
     Args:
-        action: The action containing the fcurves
-        bone_name: The bone name (for pose mode) or None (for object mode)
-        frame: The frame number to check
+        action: 包含 fcurves 的动作
+        bone_name: 骨骼名称（用于姿态模式）或 None（用于对象模式）
+        frame: 要检查的帧号
         
     Returns:
-        bool: True if the keyframe is selected, False otherwise
+        bool: 如果关键帧被选中则为 True，否则为 False
     """
     for fc in get_fcurves(action):
         if is_location_fcurve(fc, bone_name):
@@ -2382,7 +2374,7 @@ def is_keyframe_selected(action, bone_name, frame):
     return False
 
 def set_handle_type(context, handle_type):
-    """Set handle type for selected keyframes across all selected objects/bones"""
+    """为所有选定对象/骨骼的选定关键帧设置手柄类型"""
 
     # 收集所有需要处理的对象和骨骼
     targets = []
@@ -2421,7 +2413,7 @@ def set_handle_type(context, handle_type):
                     keyframe.handle_right_type = handle_type
                     if handle_type == 'ALIGNED' or handle_type in {'AUTO', 'AUTO_CLAMPED'}:
                         vec = mathutils.Vector(keyframe.co) - mathutils.Vector(keyframe.handle_left)
-                        # Keep original length of the right handle
+                        # 保持右手柄的原始长度
                         len_right = (mathutils.Vector(keyframe.handle_right) - mathutils.Vector(keyframe.co)).length
                         if vec.length > 0.0001:
                             vec.normalize()
@@ -2437,8 +2429,8 @@ def set_handle_type(context, handle_type):
 
 
 def _find_and_start_motion_path_operators(context):
-    """Find first available 3D View and start the motion path operators.
-    Returns True if a view was found and operators started, False otherwise.
+    """查找第一个可用的 3D 视图并启动运动路径操作员。
+    如果找到视图并启动了操作员，则返回 True，否则返回 False。
     """
     wm = context.window_manager
     for window in wm.windows:
@@ -2458,14 +2450,14 @@ def _find_and_start_motion_path_operators(context):
 
 
 def _stop_motion_path_operators(context):
-    """Stop motion path operators and clear active flags."""
+    """停止运动路径操作员并清除活动标志。"""
     wm = context.window_manager
     wm.direct_manipulation_active = False
     wm.auto_update_active = False
 
 
 class MOTIONPATH_ToggleCustomDraw(bpy.types.Operator):
-    """Toggle Custom Motion Path Drawing"""
+    """切换自定义运动路径绘制"""
     bl_idname = "motion_path.toggle_custom_draw"
     bl_label = "Toggle Custom Path"
     bl_description = "Enable/Disable Custom Motion Path Drawing"
@@ -2486,7 +2478,7 @@ class MOTIONPATH_ToggleCustomDraw(bpy.types.Operator):
         return {'FINISHED'}
 
 class MOTIONPATH_ResetPreferences(bpy.types.Operator):
-    """Reset Motion Path Preferences to Default"""
+    """将运动路径首选项重置为默认值"""
     bl_idname = "motion_path.reset_preferences"
     bl_label = "Reset to Default"
     bl_description = "Reset all motion path settings to default values"
@@ -2494,32 +2486,32 @@ class MOTIONPATH_ResetPreferences(bpy.types.Operator):
 
     def execute(self, context):
         prefs = get_addon_prefs(context)
-        # Reset Path
+        # 重置路径
         prefs.property_unset("path_width")
         prefs.property_unset("path_color")
-        # Reset Frame Points
+        # 重置帧点
         prefs.property_unset("show_frame_points")
         prefs.property_unset("frame_point_size")
         prefs.property_unset("frame_point_color")
-        # Reset Keyframes
+        # 重置关键帧
         prefs.property_unset("keyframe_point_size")
         prefs.property_unset("keyframe_point_color")
         prefs.property_unset("selected_keyframe_point_color")
-        # Reset Handles
+        # 重置手柄
         prefs.property_unset("handle_line_width")
         prefs.property_unset("handle_line_color")
         prefs.property_unset("selected_handle_line_color")
         prefs.property_unset("handle_endpoint_size")
         prefs.property_unset("handle_endpoint_color")
         prefs.property_unset("selected_handle_endpoint_color")
-        # Reset Origin
+        # 重置原点
         prefs.property_unset("show_origin_indicator")
         prefs.property_unset("origin_indicator_style")
         prefs.property_unset("origin_indicator_size")
         prefs.property_unset("origin_indicator_color")
         prefs.property_unset("origin_indicator_inner_color")
         
-        # Redraw
+        # 重绘
         for window in context.window_manager.windows:
             for area in window.screen.areas:
                 if area.type == 'VIEW_3D':
@@ -2549,21 +2541,21 @@ class MOTIONPATH_PT_header_settings(bpy.types.Panel):
 class MOTIONPATH_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
 
-    # Path
+    # 路径
     path_width: bpy.props.FloatProperty(name="Path Width", default=2.0, min=1.0, max=10.0)
     path_color: bpy.props.FloatVectorProperty(name="Path Color", subtype='COLOR', size=4, default=(0.8, 0.0, 0.0, 1.0), min=0.0, max=1.0)
     
-    # Frame Points
+    # 帧点
     show_frame_points: bpy.props.BoolProperty(name="Show Frame Points", default=True)
     frame_point_size: bpy.props.FloatProperty(name="Frame Point Size", default=4.0, min=1.0, max=20.0)
     frame_point_color: bpy.props.FloatVectorProperty(name="Frame Point Color", subtype='COLOR', size=4, default=(1.0, 1.0, 1.0, 1.0), min=0.0, max=1.0)
     
-    # Keyframe Points
+    # 关键帧点
     keyframe_point_size: bpy.props.FloatProperty(name="Keyframe Size", default=10.0, min=1.0, max=30.0)
     keyframe_point_color: bpy.props.FloatVectorProperty(name="Keyframe Color", subtype='COLOR', size=4, default=(0.953, 0.78, 0.0, 1.0), min=0.0, max=1.0)
     selected_keyframe_point_color: bpy.props.FloatVectorProperty(name="Selected Keyframe Color", subtype='COLOR', size=4, default=(1.0, 0.102, 0.0, 1.0), min=0.0, max=1.0)
     
-    # Handles
+    # 手柄
     handle_line_width: bpy.props.FloatProperty(name="Handle Line Width", default=2.0, min=1.0, max=10.0)
     handle_line_color: bpy.props.FloatVectorProperty(name="Handle Line Color", subtype='COLOR', size=4, default=(0.0, 0.0, 0.0, 1.0), min=0.0, max=1.0)
     selected_handle_line_color: bpy.props.FloatVectorProperty(name="Selected Handle Line Color", subtype='COLOR', size=4, default=(1.0, 0.776, 0.561, 1.0), min=0.0, max=1.0)
@@ -2572,7 +2564,7 @@ class MOTIONPATH_AddonPreferences(bpy.types.AddonPreferences):
     handle_endpoint_color: bpy.props.FloatVectorProperty(name="Handle Endpoint Color", subtype='COLOR', size=4, default=(0.953, 0.78, 0.0, 1.0), min=0.0, max=1.0)
     selected_handle_endpoint_color: bpy.props.FloatVectorProperty(name="Selected Handle Endpoint Color", subtype='COLOR', size=4, default=(1.0, 0.102, 0.0, 1.0), min=0.0, max=1.0)
 
-    # Origin Indicator
+    # 原点指示器
     show_origin_indicator: bpy.props.BoolProperty(name="Show Origin Indicator", default=True)
     origin_indicator_style: bpy.props.EnumProperty(
         name="Origin Style",
@@ -2590,7 +2582,7 @@ class MOTIONPATH_AddonPreferences(bpy.types.AddonPreferences):
         layout = self.layout
         prefs = self
         
-        # Add Reset Button
+        # 添加重置按钮
         row = layout.row()
         row.alignment = 'RIGHT'
         row.operator("motion_path.reset_preferences", text=iface_("Restore Defaults"), icon='LOOP_BACK')
@@ -2645,46 +2637,46 @@ class MOTIONPATH_MT_context_menu(bpy.types.Menu):
 
 def ensure_location_keyframes(context, obj):
     """
-    Ensure that for every frame where a location keyframe exists on any axis,
-    keyframes exist on all 3 axes (X, Y, Z).
+    确保对于存在位置关键帧的每一帧（在任何轴上），
+    在所有 3 个轴（X、Y、Z）上都存在关键帧。
     """
     if not obj or not obj.animation_data or not obj.animation_data.action:
         return
 
     action = obj.animation_data.action
     
-    # Determine targets: (data_path_prefix, bone_name_for_check)
+    # 确定目标：(data_path_prefix, bone_name_for_check)
     targets = []
     if obj.mode == 'POSE':
-        # In Pose mode, only process selected bones
+        # 在姿态模式下，仅处理选定骨骼
         if context.selected_pose_bones:
             for bone in context.selected_pose_bones:
                  targets.append((f'pose.bones["{bone.name}"].location', bone.name))
     else:
-        # In Object mode, process object location
+        # 在对象模式下，处理对象位置
         targets.append(('location', None))
 
-    # Use get_fcurves helper to handle Blender 5.0+ Actions
+    # 使用 get_fcurves 助手来处理 Blender 5.0+ Actions
     fcurves_collection = get_fcurves(action)
     if isinstance(fcurves_collection, list) and not fcurves_collection:
-        # If empty list, we might not have access to create new curves easily if structure is missing
-        # But if we are here, we probably have some keyframes, so try to re-fetch or fail gracefully
+        # 如果列表为空，如果结构缺失，我们可能无法轻松创建新曲线
+        # 但如果我们在这里，我们可能有关键帧，所以尝试重新获取或优雅地失败
         return
 
     for data_path_base, bone_name in targets:
-        # 1. Collect all existing frames for this target's location
+        # 1. 收集此目标位置的所有现有帧
         all_frames = set()
-        # Also keep track of which indices exist at which frame
+        # 还要跟踪哪些帧存在哪些索引
         # frame -> set of existing indices (0, 1, 2)
         frame_indices = {} 
         
         target_fcurves = []
-        # Iterate over fcurves_collection instead of action.fcurves
+        # 遍历 fcurves_collection 而不是 action.fcurves
         for fc in fcurves_collection:
             if fc.data_path == data_path_base:
                 target_fcurves.append(fc)
                 for kp in fc.keyframe_points:
-                    frame = int(round(kp.co[0])) # Use integer frames for alignment
+                    frame = int(round(kp.co[0])) # 使用整数帧进行对齐
                     all_frames.add(frame)
                     if frame not in frame_indices:
                         frame_indices[frame] = set()
@@ -2693,7 +2685,7 @@ def ensure_location_keyframes(context, obj):
         if not target_fcurves:
             continue
 
-        # 2. Fill missing frames
+        # 2. 填充缺失的帧
         sorted_frames = sorted(list(all_frames))
         
         modified = False
@@ -2704,23 +2696,23 @@ def ensure_location_keyframes(context, obj):
             
             if missing_indices:
                 for axis_index in missing_indices:
-                    # Check if fcurve exists for this axis
+                    # 检查此轴是否存在 fcurve
                     fc = next((f for f in target_fcurves if f.array_index == axis_index), None)
                     
                     if fc:
                         val = fc.evaluate(frame)
                         fc.keyframe_points.insert(frame, val)
                     else:
-                        # Create FCurve if missing using fcurves_collection.new()
+                        # 如果缺失，使用 fcurves_collection.new() 创建 FCurve
                         try:
-                            # Verify if fcurves_collection supports .new()
+                            # 验证 fcurves_collection 是否支持 .new()
                             if hasattr(fcurves_collection, 'new'):
                                 fc = fcurves_collection.new(data_path=data_path_base, index=axis_index)
                                 target_fcurves.append(fc)
                                 
-                                # Get current static value
+                                # 获取当前静态值
                                 if bone_name:
-                                    # Pose bone location
+                                    # 姿态骨骼位置
                                     val = obj.pose.bones[bone_name].location[axis_index]
                                 else:
                                     val = obj.location[axis_index]
@@ -2773,16 +2765,16 @@ classes = (
 )
 
 motion_path_update_mode_items = [
-    ('SMART', "Smart (Event)", "Update only when relevant data changes (Zero idle power)"),
-    ('TIMER', "Timer (Polling)", "Update periodically (Stable but higher power)")
+    ('SMART', "智能 (事件)", "仅在相关数据更改时更新（零空闲功耗）"),
+    ('TIMER', "计时器 (轮询)", "定期更新（稳定但功耗较高）")
 ]
 
 handle_type_items = [
-    ('FREE', "Free", "Handles can be adjusted independently"),
-    ('ALIGNED', "Aligned", "Handles are aligned to maintain smoothness"),
-    ('VECTOR', "Vector", "Creates linear interpolation"),
-    ('AUTO', "Auto", "Automatic smooth handles"),
-    ('AUTO_CLAMPED', "Auto Clamped", "Automatic handles with clamped values"),
+    ('FREE', "自由", "手柄可以独立调整"),
+    ('ALIGNED', "对齐", "手柄对齐以保持平滑"),
+    ('VECTOR', "矢量", "创建线性插值"),
+    ('AUTO', "自动", "自动平滑手柄"),
+    ('AUTO_CLAMPED', "自动钳位", "具有钳位值的自动手柄"),
 ]
 
 def register():
@@ -2809,7 +2801,7 @@ def register():
         default=False
     )
     
-    # Performance Settings
+    # 性能设置
     bpy.types.WindowManager.motion_path_fps_limit = bpy.props.IntProperty(
         name="Max FPS Limit",
         description="Limit the frame rate of interaction and redrawing to save power",
@@ -2859,14 +2851,14 @@ def register():
         max=10.0
     )
     
-    # Append to headers
+    # 附加到标题
     if hasattr(bpy.types, "VIEW3D_HT_header"):
         bpy.types.VIEW3D_HT_header.append(draw_header_button)
 
 def unregister():
     global _circle_aa_shader
     _circle_aa_shader = None
-    # Remove from headers
+    # 从标题中移除
     if hasattr(bpy.types, "VIEW3D_HT_header"):
         bpy.types.VIEW3D_HT_header.remove(draw_header_button)
 
