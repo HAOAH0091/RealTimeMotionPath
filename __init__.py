@@ -34,7 +34,7 @@ class MotionPathState:
         self.drag_start_item_pos = None
         self.selected_path_point = None
         self.selected_frame = None
- b          self.selected_handle_side = None
+        self.selected_handle_side = None
         self.selected_bone_name = None  # 骨骼名称字符串（安全，无直接RNA引用）
         self.handle_points = []
         self.selected_handle_point = None
