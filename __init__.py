@@ -3,7 +3,7 @@ bl_info = {
     "author" : "HAOAH",
     "description" : "在 3D 视口中显示和操作实时运动路径，支持直接手柄编辑和图形编辑器同步",
     "blender" : (5, 0, 0),
-    "version" : (1, 0, 0),
+    "version" : (1, 1, 0),
     "location" : "3D Viewport › Header",
     "warning" : "",
     "doc_url" : "",
