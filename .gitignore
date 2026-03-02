@@ -1,8 +1,0 @@
-# Python 编译缓存
-__pycache__/
-
-# Trae 协同工具相关文件
-.trae/
-
-# 备份文件
-__init__.py.backup
