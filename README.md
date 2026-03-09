@@ -4,6 +4,9 @@
 
 RealTimeMotionPath 是一个 Blender 动画插件，可以在 3D 视口中实时显示和编辑物体或骨骼的运动路径。你可以直接在 3D 视图中拖拽关键帧、调整曲线手柄，让动画制作更加直观和高效！
 
+<img width="2107" height="1316" alt="image" src="https://github.com/user-attachments/assets/c427f5b1-c64f-4215-b93e-3a9c5018e03c" />
+
+
 ## 主要功能
 
 - 🎯 **实时运动路径显示** - 在 3D 视口中直接看到物体/骨骼的运动轨迹
@@ -18,6 +21,9 @@ RealTimeMotionPath 是一个 Blender 动画插件，可以在 3D 视口中实时
 在 3D 视图顶部的标题栏中，找到并点击这个图标：🎯 (IPO_BEZIER)
 
 点击后运动路径就会开始显示！
+
+<img width="349" height="100" alt="image" src="https://github.com/user-attachments/assets/4bf5a0a5-dae9-4830-acd3-93969a1cb917" />
+
 
 ### 2. 显示运动路径
 
